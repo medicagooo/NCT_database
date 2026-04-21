@@ -367,5 +367,6 @@ curl -X POST https://api.example.com/api/sub/report \
 
 已经在本地执行通过：
 
+- `npm run test`
 - `npm run check`
 - `npm run build`

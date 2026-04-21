@@ -20,12 +20,14 @@
     "noEmit": true,
     "jsx": "react-jsx",
     "types": [
-      "@cloudflare/workers-types"
+      "@cloudflare/workers-types",
+      "node"
     ]
   },
   "include": [
     "src",
     "vite.config.ts",
+    "vitest.config.ts",
     "worker-configuration.d.ts"
   ]
 }

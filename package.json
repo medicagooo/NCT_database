@@ -11,7 +11,9 @@
     "build": "vite build",
     "deploy": "npm run build && wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run test",
     "db:migrate": "wrangler d1 migrations apply DB --local --persist-to .wrangler/state",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote"
   },
@@ -25,12 +27,14 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260418.1",
+    "@types/node": "^25.6.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
     "concurrently": "^9.2.1",
     "typescript": "^6.0.3",
     "vite": "^8.0.8",
+    "vitest": "^4.1.5",
     "wrangler": "^4.83.0"
   }
 }
