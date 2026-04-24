@@ -112,6 +112,11 @@ const sampleSnapshot: AdminSnapshot = {
       lastPullStatus: 'ok',
       lastPullResponseCode: 200,
       lastPullError: null,
+      authFailureCount: 0,
+      blacklistedAt: null,
+      authIssuedAt: '2026-04-21T00:00:00.000Z',
+      authLastSuccessAt: '2026-04-21T00:02:00.000Z',
+      authLastFailureAt: null,
     },
   ],
 };

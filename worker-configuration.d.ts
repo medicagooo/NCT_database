@@ -5,12 +5,10 @@ interface Env {
   APP_NAME?: string;
   DEFAULT_ENCRYPT_FIELDS?: string;
   ENCRYPTION_KEY: string;
-  ENCRYPTION_KEY_VERSION?: string;
-  ADMIN_TOKEN?: string;
   INGEST_TOKEN?: string;
-  SYNC_TOKEN?: string;
-  SUB_REPORT_TOKEN?: string;
-  SUB_PUSH_TOKEN?: string;
+  SERVICE_ENCRYPTION_PRIVATE_KEY?: string;
+  SERVICE_SIGNING_PRIVATE_KEY?: string;
+  SUB_AUTH_MAX_FAILURES?: string;
   SUB_REPORT_MIN_INTERVAL_MS?: string;
   SUB_PULL_BATCH_SIZE?: string;
   SUB_PULL_RECORD_LIMIT?: string;
@@ -18,6 +16,4 @@ interface Env {
   RESEND_API_KEY?: string;
   EXPORT_EMAIL_TO?: string;
   EXPORT_EMAIL_FROM?: string;
-  EXPORT_WEBHOOK_URL?: string;
-  EXPORT_TIMEZONE?: string;
 }

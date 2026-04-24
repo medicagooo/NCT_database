@@ -9,11 +9,22 @@ export type JsonObject = {
   [key: string]: JsonValue;
 };
 
-export interface EncryptedEnvelope {
+export interface AesGcmEncryptedEnvelope {
   algorithm: 'AES-GCM';
   iv: string;
   ciphertext: string;
 }
+
+export interface RsaOaepEncryptedEnvelope {
+  algorithm: 'RSA-OAEP-SHA-256+A256GCM';
+  encryptedKey: string;
+  iv: string;
+  ciphertext: string;
+}
+
+export type EncryptedEnvelope =
+  | AesGcmEncryptedEnvelope
+  | RsaOaepEncryptedEnvelope;
 
 export interface SecureTransferPayload {
   keyVersion: number;
@@ -75,14 +86,60 @@ export interface DownstreamClient {
   lastPullStatus: string | null;
   lastPullResponseCode: number | null;
   lastPullError: string | null;
+  authFailureCount: number;
+  blacklistedAt: string | null;
+  authIssuedAt: string | null;
+  authLastSuccessAt: string | null;
+  authLastFailureAt: string | null;
 }
 
 export interface SubReportPayload {
   service: string;
+  serviceWatermark: string;
   serviceUrl: string;
   databackVersion: number | null;
   reportCount: number;
   reportedAt: string;
+}
+
+export interface SubBootstrapPayload {
+  service: string;
+  serviceWatermark: string;
+  serviceUrl: string;
+  subServiceEncryptionPublicKey: string;
+  reportedAt: string;
+}
+
+export interface SubBootstrapAcceptedPayload {
+  accepted: boolean;
+  encryptedAuthToken: RsaOaepEncryptedEnvelope;
+  motherServicePublicKey?: string | null;
+  motherServiceEncryptionPublicKey?: string | null;
+}
+
+export interface SubFormRecordPayload {
+  databackFingerprint: string;
+  databackVersion: number;
+  payload: JsonObject;
+  updatedAt: string;
+  recordKey: string;
+}
+
+export interface SubFormRecordsRequest {
+  serviceUrl: string;
+  records: SubFormRecordPayload[];
+}
+
+export interface SubFormRecordResult {
+  databackFingerprint: string;
+  motherVersion: number;
+  updated: boolean;
+  recordKey: string;
+}
+
+export interface SubFormRecordsResponse {
+  accepted: boolean;
+  results: SubFormRecordResult[];
 }
 
 export interface IngestRecordInput {
@@ -138,10 +195,10 @@ export interface SubPushPayload {
 }
 
 export interface SubDatabackExportRecord {
+  payloadEncryptionState: 'plain-json' | 'secure-transfer';
   recordKey: string;
   version: number;
   fingerprint: string;
-  payload: SecureTransferPayload;
   updatedAt: string;
 }
 
@@ -152,6 +209,7 @@ export interface SubDatabackExportFile {
   currentVersion: number | null;
   exportedAt: string;
   totalRecords: number;
+  encryptedRecords: RsaOaepEncryptedEnvelope;
   records: SubDatabackExportRecord[];
 }
 

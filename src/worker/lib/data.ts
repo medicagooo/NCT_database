@@ -9,16 +9,27 @@ import type {
   PublicDatasetItem,
   PublicDatasetResponse,
   RawRecord,
+  RsaOaepEncryptedEnvelope,
   SecureRecord,
   SecureTransferPayload,
+  SubBootstrapPayload,
   SubDatabackExportFile,
+  SubFormRecordResult,
+  SubFormRecordsRequest,
   SubPushPayload,
   SubPushRecord,
   SubReportPayload,
   SyncPayload,
   SyncRequest,
 } from '../../shared/types';
-import { decryptObject, encryptObject, sha256 } from './crypto';
+import {
+  decryptJsonWithPrivateKey,
+  decryptObject,
+  deriveEncryptionPublicKeyFromPrivateKey,
+  encryptJsonWithPublicKey,
+  encryptObject,
+  sha256,
+} from './crypto';
 import {
   ensureDynamicColumns,
   extractDynamicColumns,
@@ -30,6 +41,10 @@ import {
   stableStringify,
   toJsonObject,
 } from './json';
+import {
+  buildServiceAuthHeaders,
+  deriveSigningPublicKeyFromPrivateKey,
+} from './security';
 
 type RawRecordRow = Record<string, unknown> & {
   id: string;
@@ -80,6 +95,13 @@ type DownstreamClientRow = {
   last_pull_status: string | null;
   last_pull_response_code: number | null;
   last_pull_error: string | null;
+  auth_failure_count: number | null;
+  blacklisted_at: string | null;
+  auth_token_hash: string | null;
+  sub_service_encryption_public_key: string | null;
+  auth_issued_at: string | null;
+  auth_last_success_at: string | null;
+  auth_last_failure_at: string | null;
 };
 
 type ColumnAssignment = {
@@ -91,8 +113,12 @@ const RECOGNIZED_SUB_SERVICES = new Set([
   'NCT API SQL Sub',
   'nct-api-sql-sub',
 ]);
+export const NCT_SUB_SERVICE_WATERMARK = 'nct-api-sql-sub:v1';
 const SUB_PUSH_PATH = '/api/push/secure-records';
 const SUB_EXPORT_PATH = '/api/export/nct_databack';
+const CURRENT_ENCRYPTION_KEY_VERSION = 1;
+const SUB_FORM_SOURCE_PREFIX = 'sub-form:';
+const SUB_RECOVERY_SOURCE_PREFIX = 'sub-recovery:';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -284,6 +310,7 @@ function buildDynamicAssignments(
   fieldNames: Iterable<string>,
   values: Record<string, JsonValue>,
 ): ColumnAssignment[] {
+  // When a field exists in the evolving schema but not in this payload, write NULL so old values do not linger on update.
   return collectFieldNames(fieldNames).flatMap((fieldName) => {
     const column = mappings.get(fieldName);
     if (!column) {
@@ -392,6 +419,11 @@ function mapDownstreamClient(
     lastPullStatus: row.last_pull_status,
     lastPullResponseCode: row.last_pull_response_code,
     lastPullError: row.last_pull_error,
+    authFailureCount: Number(row.auth_failure_count ?? 0),
+    blacklistedAt: row.blacklisted_at,
+    authIssuedAt: row.auth_issued_at,
+    authLastSuccessAt: row.auth_last_success_at,
+    authLastFailureAt: row.auth_last_failure_at,
   };
 }
 
@@ -464,8 +496,336 @@ function mapSecureRecordToSubPushRecord(
 
 export function isRecognizedSubService(
   serviceName: string,
+  serviceWatermark: string,
 ): boolean {
-  return RECOGNIZED_SUB_SERVICES.has(serviceName.trim());
+  return (
+    RECOGNIZED_SUB_SERVICES.has(serviceName.trim())
+    && serviceWatermark.trim() === NCT_SUB_SERVICE_WATERMARK
+  );
+}
+
+async function readDownstreamClientRowByServiceUrl(
+  db: D1Database,
+  serviceUrl: string,
+): Promise<DownstreamClientRow | null> {
+  return db.prepare(
+    `
+      SELECT *
+      FROM downstream_clients
+      WHERE service_url = ?
+         OR callback_url = ?
+      LIMIT 1
+    `,
+  )
+    .bind(serviceUrl, buildSubReportKey(serviceUrl))
+    .first<DownstreamClientRow>();
+}
+
+async function readDownstreamClientRowById(
+  db: D1Database,
+  id: number,
+): Promise<DownstreamClientRow | null> {
+  return db.prepare(
+    `
+      SELECT *
+      FROM downstream_clients
+      WHERE id = ?
+      LIMIT 1
+    `,
+  )
+    .bind(id)
+    .first<DownstreamClientRow>();
+}
+
+async function readDownstreamClientRowByAuthTokenHash(
+  db: D1Database,
+  authTokenHash: string,
+): Promise<DownstreamClientRow | null> {
+  return db.prepare(
+    `
+      SELECT *
+      FROM downstream_clients
+      WHERE auth_token_hash = ?
+      LIMIT 1
+    `,
+  )
+    .bind(authTokenHash)
+    .first<DownstreamClientRow>();
+}
+
+async function readDownstreamClientByServiceUrl(
+  db: D1Database,
+  serviceUrl: string,
+): Promise<DownstreamClient | null> {
+  const row = await readDownstreamClientRowByServiceUrl(db, serviceUrl);
+  return row ? mapDownstreamClient(row) : null;
+}
+
+async function readDownstreamClientById(
+  db: D1Database,
+  id: number,
+): Promise<DownstreamClient | null> {
+  const row = await readDownstreamClientRowById(db, id);
+  return row ? mapDownstreamClient(row) : null;
+}
+
+export async function bootstrapSubServiceAuth(
+  env: Env,
+  payload: SubBootstrapPayload,
+): Promise<{
+  encryptedAuthToken: RsaOaepEncryptedEnvelope;
+  motherServiceEncryptionPublicKey: string | null;
+  motherServicePublicKey: string | null;
+  stored: DownstreamClient;
+}> {
+  if (!isRecognizedSubService(payload.service, payload.serviceWatermark)) {
+    throw new Error('Only nct-api-sql-sub bootstrap requests are accepted.');
+  }
+
+  const serviceUrl = payload.serviceUrl.trim();
+  const existing = await readDownstreamClientRowByServiceUrl(env.DB, serviceUrl);
+  if (existing?.blacklisted_at) {
+    throw new Error('This sub service has been blacklisted.');
+  }
+
+  const motherServicePublicKey = env.SERVICE_SIGNING_PRIVATE_KEY
+    ? await deriveSigningPublicKeyFromPrivateKey(env.SERVICE_SIGNING_PRIVATE_KEY)
+    : null;
+  const motherServiceEncryptionPublicKey = env.SERVICE_ENCRYPTION_PRIVATE_KEY
+    ? await deriveEncryptionPublicKeyFromPrivateKey(env.SERVICE_ENCRYPTION_PRIVATE_KEY)
+    : null;
+
+  if (!motherServiceEncryptionPublicKey) {
+    throw new Error('SERVICE_ENCRYPTION_PRIVATE_KEY is required for sub bootstrap.');
+  }
+
+  const authToken = `${crypto.randomUUID()}.${crypto.randomUUID()}`;
+  const authTokenHash = await sha256(authToken);
+  const receivedAt = nowIso();
+  const storageKey = buildSubReportKey(serviceUrl);
+  const encryptedAuthToken = await encryptJsonWithPublicKey(
+    {
+      issuedAt: receivedAt,
+      serviceUrl,
+      token: authToken,
+    },
+    payload.subServiceEncryptionPublicKey,
+  );
+
+  await env.DB.prepare(
+    `
+      INSERT INTO downstream_clients (
+        entry_kind,
+        client_name,
+        callback_url,
+        client_version,
+        last_sync_version,
+        last_seen_at,
+        last_status,
+        last_response_code,
+        last_error,
+        service_url,
+        auth_token_hash,
+        sub_service_encryption_public_key,
+        auth_issued_at,
+        auth_failure_count,
+        blacklisted_at
+      )
+      VALUES (
+        'sub-report',
+        ?, ?, 0, 0, ?, 'bootstrapped', 202, NULL, ?, ?, ?, ?, 0, NULL
+      )
+      ON CONFLICT(callback_url) DO UPDATE SET
+        entry_kind = 'sub-report',
+        client_name = excluded.client_name,
+        last_seen_at = excluded.last_seen_at,
+        last_status = excluded.last_status,
+        last_response_code = excluded.last_response_code,
+        last_error = NULL,
+        service_url = excluded.service_url,
+        auth_token_hash = excluded.auth_token_hash,
+        sub_service_encryption_public_key = excluded.sub_service_encryption_public_key,
+        auth_issued_at = excluded.auth_issued_at,
+        auth_failure_count = 0,
+        blacklisted_at = NULL
+    `,
+  )
+    .bind(
+      payload.service,
+      storageKey,
+      receivedAt,
+      serviceUrl,
+      authTokenHash,
+      payload.subServiceEncryptionPublicKey,
+      receivedAt,
+    )
+    .run();
+
+  const stored = await readDownstreamClientByServiceUrl(env.DB, serviceUrl);
+  if (!stored) {
+    throw new Error('Failed to persist sub bootstrap state.');
+  }
+
+  return {
+    encryptedAuthToken,
+    motherServiceEncryptionPublicKey,
+    motherServicePublicKey,
+    stored,
+  };
+}
+
+async function recordSubAuthFailure(
+  db: D1Database,
+  row: DownstreamClientRow,
+  maxFailures: number,
+  reason: string,
+  responseCode: 401 | 403 = 401,
+): Promise<{
+  blacklisted: boolean;
+  currentCount: number;
+}> {
+  const failureCount = Number(row.auth_failure_count ?? 0) + 1;
+  const failedAt = nowIso();
+  const blacklistedAt = failureCount >= maxFailures ? failedAt : null;
+
+  await db.prepare(
+    `
+      UPDATE downstream_clients
+      SET auth_failure_count = ?,
+          auth_last_failure_at = ?,
+          blacklisted_at = COALESCE(blacklisted_at, ?),
+          last_response_code = ?,
+          last_error = ?
+      WHERE id = ?
+    `,
+  )
+    .bind(
+      failureCount,
+      failedAt,
+      blacklistedAt,
+      responseCode,
+      reason,
+      row.id,
+    )
+    .run();
+
+  return {
+    blacklisted: blacklistedAt !== null || row.blacklisted_at !== null,
+    currentCount: failureCount,
+  };
+}
+
+export async function verifySubServiceToken(
+  db: D1Database,
+  claimedServiceUrl: string,
+  token: string | null,
+  maxFailures: number,
+): Promise<
+  | { ok: true; stored: DownstreamClient }
+  | { ok: false; reason: string; status: 401 | 403 }
+> {
+  if (!token?.trim()) {
+    return {
+      ok: false,
+      reason: 'Sub service token is required.',
+      status: 401,
+    };
+  }
+
+  const tokenHash = await sha256(token.trim());
+  const row = await readDownstreamClientRowByAuthTokenHash(db, tokenHash);
+  if (!row) {
+    return {
+      ok: false,
+      reason: 'Sub service token is invalid.',
+      status: 401,
+    };
+  }
+
+  if (row.blacklisted_at) {
+    return {
+      ok: false,
+      reason: 'This sub service has been blacklisted.',
+      status: 403,
+    };
+  }
+
+  const normalizedClaimedServiceUrl = claimedServiceUrl.trim();
+  const normalizedStoredServiceUrl = row.service_url?.trim() || '';
+  if (
+    normalizedClaimedServiceUrl
+    && normalizedStoredServiceUrl
+    && normalizedClaimedServiceUrl !== normalizedStoredServiceUrl
+  ) {
+    const failure = await recordSubAuthFailure(
+      db,
+      row,
+      maxFailures,
+      'Sub service identity does not match the claimed service URL.',
+      403,
+    );
+    return {
+      ok: false,
+      reason: failure.blacklisted
+        ? 'Sub service identity does not match the claimed service URL and this service is now blacklisted.'
+        : 'Sub service identity does not match the claimed service URL.',
+      status: 403,
+    };
+  }
+
+  const authenticatedAt = nowIso();
+  await db.prepare(
+    `
+      UPDATE downstream_clients
+      SET auth_failure_count = 0,
+          auth_last_success_at = ?,
+          last_seen_at = ?,
+          last_error = NULL
+      WHERE id = ?
+    `,
+  )
+    .bind(
+      authenticatedAt,
+      authenticatedAt,
+      row.id,
+    )
+    .run();
+
+  const stored = await readDownstreamClientById(db, row.id);
+  if (!stored) {
+    throw new Error('Failed to read back sub auth state.');
+  }
+
+  return {
+    ok: true,
+    stored,
+  };
+}
+
+export async function ingestSubFormRecords(
+  env: Env,
+  request: SubFormRecordsRequest,
+): Promise<SubFormRecordResult[]> {
+  const results: SubFormRecordResult[] = [];
+
+  for (const record of request.records) {
+    const [ingested] = await ingestRecords(env, [
+      {
+        payload: record.payload,
+        recordKey: record.recordKey,
+        source: `${SUB_FORM_SOURCE_PREFIX}${request.serviceUrl}`,
+      },
+    ]);
+
+    results.push({
+      databackFingerprint: record.databackFingerprint,
+      motherVersion: ingested.version,
+      recordKey: record.recordKey,
+      updated: ingested.updated,
+    });
+  }
+
+  return results;
 }
 
 export async function listRawRecords(
@@ -560,7 +920,8 @@ export async function ingestRecords(
     return [];
   }
 
-  const keyVersion = Number(env.ENCRYPTION_KEY_VERSION ?? '1');
+  // Each ingest keeps the raw table and the published secure table in lockstep, expanding dynamic columns as fields evolve.
+  const keyVersion = CURRENT_ENCRYPTION_KEY_VERSION;
   const results: IngestResult[] = [];
 
   for (const rawInput of records) {
@@ -959,22 +1320,6 @@ async function buildSubPushPayload(
   };
 }
 
-function createJsonAttachmentFormData(
-  filename: string,
-  payload: unknown,
-): FormData {
-  const formData = new FormData();
-  formData.append(
-    'file',
-    new Blob([stableStringify(toJsonObject(payload as Record<string, unknown>))], {
-      type: 'application/json',
-    }),
-    filename,
-  );
-
-  return formData;
-}
-
 function isSecureTransferPayload(
   value: unknown,
 ): value is SecureTransferPayload {
@@ -998,6 +1343,26 @@ function isSecureTransferPayload(
   );
 }
 
+function isPlainJsonObject(value: unknown): value is JsonObject {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isRsaOaepEncryptedEnvelope(
+  value: unknown,
+): value is RsaOaepEncryptedEnvelope {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.algorithm === 'RSA-OAEP-SHA-256+A256GCM'
+    && typeof candidate.encryptedKey === 'string'
+    && typeof candidate.iv === 'string'
+    && typeof candidate.ciphertext === 'string'
+  );
+}
+
 function parseSubDatabackExportFile(
   value: unknown,
 ): SubDatabackExportFile {
@@ -1014,6 +1379,7 @@ function parseSubDatabackExportFile(
       && typeof candidate.currentVersion !== 'number')
     || typeof candidate.exportedAt !== 'string'
     || typeof candidate.totalRecords !== 'number'
+    || !isRsaOaepEncryptedEnvelope(candidate.encryptedRecords)
     || !Array.isArray(candidate.records)
   ) {
     throw new Error('Sub export file is missing required fields.');
@@ -1030,16 +1396,19 @@ function parseSubDatabackExportFile(
       || typeof entry.version !== 'number'
       || typeof entry.fingerprint !== 'string'
       || typeof entry.updatedAt !== 'string'
-      || !isSecureTransferPayload(entry.payload)
+      || (
+        entry.payloadEncryptionState !== 'plain-json'
+        && entry.payloadEncryptionState !== 'secure-transfer'
+      )
     ) {
       throw new Error('Sub export record has an invalid shape.');
     }
 
     return {
+      payloadEncryptionState: entry.payloadEncryptionState as SubDatabackExportFile['records'][number]['payloadEncryptionState'],
       recordKey: entry.recordKey,
       version: entry.version,
       fingerprint: entry.fingerprint,
-      payload: entry.payload,
       updatedAt: entry.updatedAt,
     };
   });
@@ -1051,8 +1420,371 @@ function parseSubDatabackExportFile(
     currentVersion: candidate.currentVersion,
     exportedAt: candidate.exportedAt,
     totalRecords: candidate.totalRecords,
+    encryptedRecords: candidate.encryptedRecords,
     records,
   };
+}
+
+type DecryptedSubDatabackExportRecord = SubDatabackExportFile['records'][number] & {
+  payload: SecureTransferPayload | JsonObject;
+};
+
+function parseDecryptedSubDatabackExportRecords(
+  value: unknown,
+): DecryptedSubDatabackExportRecord[] {
+  if (!Array.isArray(value)) {
+    throw new Error('Decrypted sub export payload is not a record array.');
+  }
+
+  return value.map((record) => {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      throw new Error('Decrypted sub export record must be a JSON object.');
+    }
+
+    const entry = record as Record<string, unknown>;
+    if (
+      typeof entry.recordKey !== 'string'
+      || typeof entry.version !== 'number'
+      || typeof entry.fingerprint !== 'string'
+      || typeof entry.updatedAt !== 'string'
+      || (
+        entry.payloadEncryptionState !== 'plain-json'
+        && entry.payloadEncryptionState !== 'secure-transfer'
+      )
+      || (
+        !isSecureTransferPayload(entry.payload)
+        && !isPlainJsonObject(entry.payload)
+      )
+    ) {
+      throw new Error('Decrypted sub export record has an invalid shape.');
+    }
+
+    return {
+      payload: entry.payload,
+      payloadEncryptionState: entry.payloadEncryptionState,
+      recordKey: entry.recordKey,
+      version: entry.version,
+      fingerprint: entry.fingerprint,
+      updatedAt: entry.updatedAt,
+    };
+  });
+}
+
+async function computeSecureTransferFingerprint(
+  env: Env,
+  payload: SecureTransferPayload,
+): Promise<{
+  fingerprint: string;
+  secretData: JsonObject;
+}> {
+  const secretData = await decryptObject(payload.encryptedData, env.ENCRYPTION_KEY);
+
+  return {
+    fingerprint: await sha256(
+      stableStringify({
+        keyVersion: payload.keyVersion,
+        publicData: payload.publicData,
+        secretData,
+        encryptFields: payload.encryptFields,
+      }),
+    ),
+    secretData,
+  };
+}
+
+async function upsertRawRecord(
+  env: Env,
+  input: {
+    payload: JsonObject;
+    recordKey: string;
+    receivedAt?: string;
+    source: string;
+  },
+): Promise<{
+  id: string;
+}> {
+  const payload = toJsonObject(input.payload);
+  const payloadJson = stableStringify(payload);
+  const payloadHash = await sha256(payloadJson);
+  const receivedAt = input.receivedAt ?? nowIso();
+  const existingRaw = await env.DB.prepare(
+    `
+      SELECT *
+      FROM raw_records
+      WHERE record_key = ?
+    `,
+  )
+    .bind(input.recordKey)
+    .first<RawRecordRow>();
+  const previousPayload = existingRaw
+    ? parseJsonObject(existingRaw.payload_json)
+    : {};
+  const rawFieldNames = collectFieldNames(
+    Object.keys(previousPayload),
+    Object.keys(payload),
+  );
+  const rawColumnMappings = await ensureDynamicColumns(
+    env.DB,
+    'raw_records',
+    'payload',
+    rawFieldNames,
+  );
+  const rawDynamicAssignments = buildDynamicAssignments(
+    rawColumnMappings,
+    rawFieldNames,
+    payload,
+  );
+  const rawRecordId = existingRaw?.id ?? crypto.randomUUID();
+
+  if (existingRaw) {
+    const updateColumns = [
+      'source',
+      'payload_json',
+      'payload_hash',
+      'received_at',
+      'updated_at',
+      ...rawDynamicAssignments.map((assignment) => assignment.column),
+    ];
+    const updateValues = [
+      input.source,
+      payloadJson,
+      payloadHash,
+      receivedAt,
+      receivedAt,
+      ...rawDynamicAssignments.map((assignment) => assignment.value),
+      rawRecordId,
+    ];
+
+    await env.DB.prepare(
+      buildUpdateStatement('raw_records', updateColumns, 'id'),
+    )
+      .bind(...updateValues)
+      .run();
+  } else {
+    const insertColumns = [
+      'id',
+      'record_key',
+      'source',
+      'payload_json',
+      'payload_hash',
+      'received_at',
+      'created_at',
+      'updated_at',
+      ...rawDynamicAssignments.map((assignment) => assignment.column),
+    ];
+    const insertValues = [
+      rawRecordId,
+      input.recordKey,
+      input.source,
+      payloadJson,
+      payloadHash,
+      receivedAt,
+      receivedAt,
+      receivedAt,
+      ...rawDynamicAssignments.map((assignment) => assignment.value),
+    ];
+
+    await env.DB.prepare(
+      buildInsertStatement('raw_records', insertColumns),
+    )
+      .bind(...insertValues)
+      .run();
+  }
+
+  await env.DB.prepare(
+    `
+      UPDATE raw_records
+      SET processed_at = ?,
+          updated_at = ?
+      WHERE id = ?
+    `,
+  )
+    .bind(receivedAt, receivedAt, rawRecordId)
+    .run();
+
+  return {
+    id: rawRecordId,
+  };
+}
+
+async function upsertRecoveredSecureTransferRecord(
+  env: Env,
+  serviceUrl: string,
+  record: DecryptedSubDatabackExportRecord,
+): Promise<boolean> {
+  if (!isSecureTransferPayload(record.payload)) {
+    throw new Error('Recovered secure transfer payload is invalid.');
+  }
+
+  const { fingerprint, secretData } = await computeSecureTransferFingerprint(env, record.payload);
+  if (fingerprint !== record.fingerprint) {
+    throw new Error(
+      `Fingerprint mismatch while importing ${record.recordKey} from ${serviceUrl}.`,
+    );
+  }
+
+  const rawPayload = {
+    ...record.payload.publicData,
+    ...secretData,
+  };
+  const receivedAt = typeof record.updatedAt === 'string' ? record.updatedAt : nowIso();
+  const rawRecord = await upsertRawRecord(env, {
+    payload: rawPayload,
+    recordKey: record.recordKey,
+    receivedAt,
+    source: `${SUB_RECOVERY_SOURCE_PREFIX}${serviceUrl}`,
+  });
+  const existingSecure = await env.DB.prepare(
+    `
+      SELECT *
+      FROM secure_records
+      WHERE record_key = ?
+    `,
+  )
+    .bind(record.recordKey)
+    .first<SecureRecordRow>();
+  const existingVersion = Number(existingSecure?.version ?? 0);
+  const shouldUpdate = !existingSecure
+    || Number(record.version) > existingVersion
+    || (
+      Number(record.version) === existingVersion
+      && existingSecure?.fingerprint !== record.fingerprint
+    );
+
+  if (!shouldUpdate) {
+    return false;
+  }
+
+  const previousPublicData = existingSecure
+    ? parseJsonObject(existingSecure.public_json)
+    : {};
+  const previousEncryptFields = existingSecure
+    ? parseStringArray(existingSecure.encrypt_fields_json)
+    : [];
+  const previousEncryptedFieldSet = new Set(previousEncryptFields);
+  const previousEncryptedFieldNames = Object.keys({
+    ...secretData,
+  }).filter((fieldName) => previousEncryptedFieldSet.has(fieldName));
+  const publicFieldNames = collectFieldNames(
+    Object.keys(previousPublicData),
+    Object.keys(record.payload.publicData),
+  );
+  const encryptedFieldNames = collectFieldNames(
+    previousEncryptedFieldNames,
+    record.payload.encryptFields,
+  );
+  const publicColumnMappings = await ensureDynamicColumns(
+    env.DB,
+    'secure_records',
+    'public',
+    publicFieldNames,
+  );
+  const encryptedColumnMappings = await ensureDynamicColumns(
+    env.DB,
+    'secure_records',
+    'encrypted',
+    encryptedFieldNames,
+  );
+  const encryptedColumnValues: JsonObject = {};
+  for (const [fieldName, fieldValue] of Object.entries(secretData)) {
+    encryptedColumnValues[fieldName] = stableStringify(
+      await encryptObject(
+        { [fieldName]: fieldValue },
+        env.ENCRYPTION_KEY,
+      ),
+    );
+  }
+
+  const publicDynamicAssignments = buildDynamicAssignments(
+    publicColumnMappings,
+    publicFieldNames,
+    record.payload.publicData,
+  );
+  const encryptedDynamicAssignments = buildDynamicAssignments(
+    encryptedColumnMappings,
+    encryptedFieldNames,
+    encryptedColumnValues,
+  );
+  const secureRecordId = existingSecure?.id ?? crypto.randomUUID();
+  const publicJson = stableStringify(record.payload.publicData);
+  const encryptedJson = stableStringify(record.payload.encryptedData);
+
+  if (existingSecure) {
+    const updateColumns = [
+      'raw_record_id',
+      'version',
+      'key_version',
+      'public_json',
+      'encrypted_json',
+      'encrypt_fields_json',
+      'fingerprint',
+      'synced_at',
+      'updated_at',
+      ...publicDynamicAssignments.map((assignment) => assignment.column),
+      ...encryptedDynamicAssignments.map((assignment) => assignment.column),
+    ];
+    const updateValues = [
+      rawRecord.id,
+      Number(record.version),
+      Math.max(1, Number(record.payload.keyVersion)),
+      publicJson,
+      encryptedJson,
+      stableStringify(record.payload.encryptFields),
+      record.fingerprint,
+      record.payload.syncedAt,
+      receivedAt,
+      ...publicDynamicAssignments.map((assignment) => assignment.value),
+      ...encryptedDynamicAssignments.map((assignment) => assignment.value),
+      secureRecordId,
+    ];
+
+    await env.DB.prepare(
+      buildUpdateStatement('secure_records', updateColumns, 'id'),
+    )
+      .bind(...updateValues)
+      .run();
+  } else {
+    const insertColumns = [
+      'id',
+      'raw_record_id',
+      'record_key',
+      'version',
+      'key_version',
+      'public_json',
+      'encrypted_json',
+      'encrypt_fields_json',
+      'fingerprint',
+      'synced_at',
+      'created_at',
+      'updated_at',
+      ...publicDynamicAssignments.map((assignment) => assignment.column),
+      ...encryptedDynamicAssignments.map((assignment) => assignment.column),
+    ];
+    const insertValues = [
+      secureRecordId,
+      rawRecord.id,
+      record.recordKey,
+      Number(record.version),
+      Math.max(1, Number(record.payload.keyVersion)),
+      publicJson,
+      encryptedJson,
+      stableStringify(record.payload.encryptFields),
+      record.fingerprint,
+      record.payload.syncedAt,
+      receivedAt,
+      receivedAt,
+      ...publicDynamicAssignments.map((assignment) => assignment.value),
+      ...encryptedDynamicAssignments.map((assignment) => assignment.value),
+    ];
+
+    await env.DB.prepare(
+      buildInsertStatement('secure_records', insertColumns),
+    )
+      .bind(...insertValues)
+      .run();
+  }
+
+  return true;
 }
 
 async function importSubDatabackExportFile(
@@ -1069,8 +1801,29 @@ async function importSubDatabackExportFile(
   let updatedCount = 0;
   let skippedCount = 0;
   let highestPulledVersion = Math.max(0, exportFile.afterVersion);
+  const encryptionPrivateKey = env.SERVICE_ENCRYPTION_PRIVATE_KEY?.trim();
+  if (!encryptionPrivateKey) {
+    throw new Error('SERVICE_ENCRYPTION_PRIVATE_KEY is required for recovery pull import.');
+  }
 
-  for (const record of exportFile.records) {
+  const decryptedRecords = parseDecryptedSubDatabackExportRecords(
+    await decryptJsonWithPrivateKey(exportFile.encryptedRecords, encryptionPrivateKey),
+  );
+  if (decryptedRecords.length !== exportFile.records.length) {
+    throw new Error('Decrypted sub export payload count does not match the file manifest.');
+  }
+
+  for (const [index, record] of exportFile.records.entries()) {
+    const decryptedRecord = decryptedRecords[index];
+    if (
+      decryptedRecord.recordKey !== record.recordKey
+      || decryptedRecord.version !== record.version
+      || decryptedRecord.fingerprint !== record.fingerprint
+      || decryptedRecord.payloadEncryptionState !== record.payloadEncryptionState
+    ) {
+      throw new Error('Decrypted sub export payload does not match the file manifest.');
+    }
+
     highestPulledVersion = Math.max(
       highestPulledVersion,
       Math.max(0, Number(record.version)),
@@ -1085,40 +1838,41 @@ async function importSubDatabackExportFile(
       .bind(record.recordKey)
       .first<{ fingerprint: string | null }>();
 
-    if (existingSecure?.fingerprint === record.fingerprint) {
+    if (
+      record.payloadEncryptionState === 'secure-transfer'
+      && existingSecure?.fingerprint === record.fingerprint
+    ) {
       skippedCount += 1;
       continue;
     }
 
-    const secretData = await decryptObject(
-      record.payload.encryptedData,
-      env.ENCRYPTION_KEY,
-    );
-    const fingerprint = await sha256(
-      stableStringify({
-        keyVersion: record.payload.keyVersion,
-        publicData: record.payload.publicData,
-        secretData,
-        encryptFields: record.payload.encryptFields,
-      }),
-    );
+    if (record.payloadEncryptionState === 'secure-transfer') {
+      const updated = await upsertRecoveredSecureTransferRecord(
+        env,
+        serviceUrl,
+        decryptedRecord,
+      );
+      if (updated) {
+        updatedCount += 1;
+      } else {
+        skippedCount += 1;
+      }
+      continue;
+    }
 
+    const payload = toJsonObject(decryptedRecord.payload);
+    const fingerprint = await sha256(stableStringify(payload));
     if (fingerprint !== record.fingerprint) {
       throw new Error(
         `Fingerprint mismatch while importing ${record.recordKey} from ${serviceUrl}.`,
       );
     }
 
-    const payload: JsonObject = {
-      ...record.payload.publicData,
-      ...secretData,
-    };
     const [result] = await ingestRecords(env, [
       {
-        recordKey: record.recordKey,
-        source: `sub:${serviceUrl}`,
-        encryptFields: record.payload.encryptFields,
         payload,
+        recordKey: record.recordKey,
+        source: `${SUB_RECOVERY_SOURCE_PREFIX}${serviceUrl}`,
       },
     ]);
 
@@ -1318,6 +2072,7 @@ export async function recordSubReport(
   const storageKey = buildSubReportKey(report.serviceUrl);
   const persistedPayload: JsonObject = {
     service: report.service,
+    serviceWatermark: report.serviceWatermark,
     serviceUrl: report.serviceUrl,
     databackVersion: report.databackVersion,
     reportCount: report.reportCount,
@@ -1413,6 +2168,7 @@ export async function pushSecureRecordsToRegisteredSubs(
       FROM downstream_clients
       WHERE entry_kind = 'sub-report'
         AND service_url IS NOT NULL
+        AND blacklisted_at IS NULL
       ORDER BY COALESCE(databack_version, 0) DESC, last_seen_at DESC
     `,
   ).all<DownstreamClientRow>();
@@ -1474,20 +2230,18 @@ export async function pushSecureRecordsToRegisteredSubs(
     );
 
     try {
-      const formData = createJsonAttachmentFormData(
-        `secure-records-v${currentVersion}.json`,
-        payload as unknown as Record<string, unknown>,
-      );
+      const body = JSON.stringify(payload);
       const response = await fetch(pushUrl, {
         method: 'POST',
         headers: {
-          ...(env.SUB_PUSH_TOKEN
-            ? {
-                authorization: `Bearer ${env.SUB_PUSH_TOKEN}`,
-              }
-            : {}),
+          'content-type': 'application/json',
+          ...await buildServiceAuthHeaders(env, {
+            body,
+            method: 'POST',
+            url: pushUrl,
+          }),
         },
-        body: formData,
+        body,
       });
 
       if (response.ok) {
@@ -1627,6 +2381,7 @@ export async function pullDatabackFromRegisteredSubs(
       FROM downstream_clients
       WHERE entry_kind = 'sub-report'
         AND service_url IS NOT NULL
+        AND blacklisted_at IS NULL
       ORDER BY COALESCE(databack_version, 0) DESC, last_seen_at DESC
       LIMIT ?
     `,
@@ -1720,13 +2475,10 @@ export async function pullDatabackFromRegisteredSubs(
         try {
           const response = await fetch(requestUrl.toString(), {
             method: 'GET',
-            headers: {
-              ...(env.SUB_PUSH_TOKEN
-                ? {
-                    authorization: `Bearer ${env.SUB_PUSH_TOKEN}`,
-                  }
-                : {}),
-            },
+            headers: await buildServiceAuthHeaders(env, {
+              method: 'GET',
+              url: requestUrl.toString(),
+            }),
             signal: controller.signal,
           });
           responseCode = response.status;

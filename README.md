@@ -5,7 +5,7 @@
 - 接收下游推送数据并写入未加密原始表
 - 根据原始表生成部分列加密的发布表，并维护版本号
 - 记录 `nct-api-sql-sub` 定时上报的域名、版本号和上报次数
-- 每 20 分钟主动向已登记的 `nct-api-sql-sub` 推送第二张表数据
+- 供各个 `nct-api-sql-sub` 主动拉取第二张表的发布数据
 - 按子库版本从新到旧主动回拉 `nct_databack` 文件，并回灌到主库的 `secure_records` 与 `raw_records`
 - 定时把 D1 三张表打包到 R2，并以邮件附件形式发出
 - 提供 liquid glass 风格的管理台，用于查询、管理、分析、调试
@@ -83,7 +83,7 @@
 
 - `POST /api/sync`
 已废弃。
-主库不再接收下游拉取同步请求，改为由 cron 主动向已登记子库推送。
+主库不再负责主动推送到子库；`nct-api-sql-sub` 会自行拉取 `GET /api/public/secure-records`。
 
 - `POST /api/sub/report`
 只接收 `nct-api-sql-sub` 的上报。
@@ -91,11 +91,11 @@
 同一子库的重复上报会按 `SUB_REPORT_MIN_INTERVAL_MS` 做限频，过快会返回 `429`。
 
 - `POST /api/admin/push-now`
-手动触发一次“主库 -> 已登记子库”的主动推送。
-推送内容会以 `multipart/form-data` 的 JSON 附件文件发送到子库的 `POST /api/push/secure-records`。
+已废弃。
+保留该路由仅为了给旧调用方返回明确的 `410` 提示，不再触发任何同步动作。
 
 - `POST /api/admin/pull-now`
-手动触发一次“主库 <- 已登记子库”的主动回拉。
+手动触发一次“主库 <- 已登记子库”的灾备回拉。
 主库会按第三表中记录的子库版本，从新到旧调用子库的 `GET /api/export/nct_databack`，接收 JSON 附件文件并导入回主库。
 
 - `GET /api/public/secure-records`
@@ -106,17 +106,18 @@
 
 ### 定时任务
 
-`wrangler.toml` 默认配置了 UTC Cron：
+`wrangler.toml` 默认只配置导出 Cron：
 
 ```toml
 [triggers]
-crons = ["*/20 * * * *", "0 18 * * *"]
+crons = ["0 18 * * *"]
 ```
 
 其中：
 
-- `*/20 * * * *` 表示每 20 分钟执行一次“主推 + 回拉”同步周期
 - `0 18 * * *` 表示每天 `18:00 UTC` 触发导出。按 `Asia/Shanghai` 来看，相当于次日 `02:00`
+
+子库侧的同步不再由母库 cron 发起，而是由各自部署的 `nct-api-sql-sub` 在自己的定时任务中主动执行。
 
 ## 本地开发
 
@@ -134,36 +135,61 @@ npx wrangler r2 bucket create nct-api-sql-exports
 npx wrangler r2 bucket create nct-api-sql-exports-preview
 ```
 
-把创建出来的 `database_id` 和 bucket 名称填回 [wrangler.toml](/home/medicago/projects/nct-api-sql/wrangler.toml)。
+把创建出来的 `database_id` 和 bucket 名称填回 [`wrangler.toml`](./wrangler.toml)。
 
 ### 3. 准备本地密钥和令牌
 
 ```bash
-cp .dev.vars.example .dev.vars
+cp .env.example .dev.vars
 openssl rand -base64 32
 ```
 
-把生成的 base64 值写入 `ENCRYPTION_KEY`。如果你希望管理台、写入接口和同步接口分别鉴权，可以分别设置：
+[`./.env.example`](./.env.example) 已按修改必要性排序列出当前项目的全部环境变量。
+本地 Wrangler 仍然读取 `.dev.vars`，线上部署则把同名键写入 Cloudflare Variables / Secrets。
 
-- `ADMIN_TOKEN`
-- `INGEST_TOKEN`
-- `SYNC_TOKEN`
-- `SUB_REPORT_TOKEN`
-- `SUB_PUSH_TOKEN`
+#### 必填环境变量
+
+完整列表见 [`./.env.example`](./.env.example)。这里先标出真正需要优先确认的几项：
+
+- 绝对必填：`ENCRYPTION_KEY`
+- 平台绑定必填但不写进 `.env`：`DB`、`ASSETS`、`EXPORT_BUCKET`，在 [`wrangler.toml`](./wrangler.toml) 中绑定 D1、静态资产和 R2
+- 管理台密码不再通过环境变量配置；部署后首次打开 `/Console` 设置
+- 外部写入源调用 `/api/ingest` 时建议设置：`INGEST_TOKEN`
+- 与 `nct-api-sql-sub` 联动时强烈建议视为必填：`SERVICE_SIGNING_PRIVATE_KEY`
+- 按功能必填：`RESEND_API_KEY`、`EXPORT_EMAIL_TO`、`EXPORT_EMAIL_FROM` 仅在你要启用邮件导出时需要
+
+把生成的 base64 值写入 `ENCRYPTION_KEY`。服务间调用优先使用 ECDSA P-256 请求签名：
+
+- 母库自己的 `SERVICE_SIGNING_PRIVATE_KEY` 用于签名母库回拉子库请求，以及签名 `GET /api/public/secure-records` 返回的 payload envelope
+- 母库返回给子库的 `GET /api/public/secure-records` payload 现在只做签名；记录里的 `encryptedData` 仍然是母库 t2 字段密文
+- 母库会在接受子库上报后，把自己的签名公钥自动返回给子库缓存；子库后续据此识别母库身份
+- 母库不再要求子库回传数据时做额外字段加密；子库本地普通 JSON 回传后，由母库按自身 `ENCRYPTION_KEY` 重新生成 t2
+
+下面这些变量不是鉴权凭据，而是 mother/sub 同步调优项：
+
 - `SUB_REPORT_MIN_INTERVAL_MS`
 - `SUB_PULL_BATCH_SIZE`
 - `SUB_PULL_RECORD_LIMIT`
 - `SUB_PULL_TIMEOUT_MS`
 
-管理台当前直接使用 `ADMIN_TOKEN` 和 `INGEST_TOKEN`。
-`SUB_REPORT_TOKEN` 用于 `nct-api-sql-sub -> nct-api-sql` 的服务间上报鉴权。
-`SUB_PUSH_TOKEN` 用于 `nct-api-sql -> nct-api-sql-sub` 的服务间推送与回拉鉴权。
+管理台首次打开时会把你设置的管理员密码哈希写入 D1，之后登录会得到短期 session token。
+如果 `INGEST_TOKEN` 留空，`/api/ingest` 只接受已登录管理台 session；如果要让外部程序推送数据，应单独设置 `INGEST_TOKEN`。
+新链路中，母库主要负责：
+签名 `GET /api/public/secure-records` 的响应，
+以及签名 `nct-api-sql -> nct-api-sql-sub` 的灾备回拉请求。
 `SUB_REPORT_MIN_INTERVAL_MS` 用于限制主库接收子库上报的最小时间间隔。
 `SUB_PULL_BATCH_SIZE` 表示每轮最多处理多少个已登记子库。
 `SUB_PULL_RECORD_LIMIT` 表示每次从单个子库拉取多少条 `nct_databack` 记录。
 `SUB_PULL_TIMEOUT_MS` 表示主库请求子库导出文件时的超时时间。
-`SYNC_TOKEN` 仍可用于保护 `GET /api/public/secure-records` 这类公开同步数据接口。
-如果 `INGEST_TOKEN` 留空，前端会回退使用 `ADMIN_TOKEN`。
+
+生成推荐密钥的最小命令：
+
+```bash
+# 服务请求签名。母库保存私钥，子库会在首次成功上报后缓存母库公钥。
+openssl ecparam -name prime256v1 -genkey -noout -out mother-signing.key
+openssl pkcs8 -topk8 -nocrypt -in mother-signing.key -out mother-signing.pkcs8.pem
+npm run key:derive-public -- ./mother-signing.pkcs8.pem > mother-signing.pub.pem
+```
 
 ### 4. 执行 D1 migration
 
@@ -264,7 +290,7 @@ npm run db:migrate:remote
 - 管理台入口：`https://api.example.com/Console`
 - 健康检查：`https://api.example.com/api/health`
 - 数据写入：`https://api.example.com/api/ingest`
-- 主动推送：`https://api.example.com/api/admin/push-now`
+- 灾备回拉：`https://api.example.com/api/admin/pull-now`
 - 子库上报：`https://api.example.com/api/sub/report`
 - 公布数据：`https://api.example.com/api/public/secure-records`
 - 管理导出：`https://api.example.com/api/admin/export-now`
@@ -339,23 +365,24 @@ curl -X POST https://api.example.com/api/ingest \
   }'
 ```
 
-### 手动触发主动推送
+### 手动触发灾备回拉
 
 ```bash
-curl -X POST https://api.example.com/api/admin/push-now \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+curl -X POST https://api.example.com/api/admin/pull-now \
+  -H "Authorization: Bearer YOUR_CONSOLE_SESSION_TOKEN"
 ```
 
 ### 子库上报
 
 `/api/sub/report` 只接受 `nct-api-sql-sub` 的上报，其他 `service` 会被拒绝。
+母库识别 `serviceWatermark` 后，会在响应里返回自己的签名公钥，供子库缓存。
 
 ```bash
 curl -X POST https://api.example.com/api/sub/report \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_SUB_REPORT_TOKEN" \
   -d '{
     "service": "NCT API SQL Sub",
+    "serviceWatermark": "nct-api-sql-sub:v1",
     "serviceUrl": "https://sub.example.com",
     "databackVersion": 12,
     "reportCount": 7,

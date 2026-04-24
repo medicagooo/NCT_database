@@ -1,8 +1,12 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import type { Context } from 'hono';
 import { z } from 'zod';
 import { toJsonObject } from './lib/json';
 import {
+  bootstrapSubServiceAuth,
+  ingestSubFormRecords,
+  NCT_SUB_SERVICE_WATERMARK,
   getAdminSnapshot,
   getSubReportThrottleState,
   getPublicDataset,
@@ -13,9 +17,23 @@ import {
   pushSecureRecordsToRegisteredSubs,
   rebuildSecureRecords,
   recordSubReport,
+  verifySubServiceToken,
 } from './lib/data';
 import { exportSnapshot } from './lib/export';
-import { assertToken } from './lib/security';
+import { deriveEncryptionPublicKeyFromPrivateKey } from './lib/crypto';
+import {
+  AdminAuthError,
+  assertAdminAuth,
+  deleteAdminSession,
+  getAdminAuthStatus,
+  loginAdminPassword,
+  setupAdminPassword,
+} from './lib/adminAuth';
+import {
+  assertToken,
+  deriveSigningPublicKeyFromPrivateKey,
+  signPayloadEnvelope,
+} from './lib/security';
 
 const ingestSchema = z.object({
   records: z
@@ -34,16 +52,86 @@ const ingestSchema = z.object({
 
 const subReportSchema = z.object({
   service: z.string().min(1),
+  serviceWatermark: z.literal(NCT_SUB_SERVICE_WATERMARK),
   serviceUrl: z.string().url(),
   databackVersion: z.number().int().min(0).nullable(),
   reportCount: z.number().int().min(1),
   reportedAt: z.string().min(1),
 });
 
-const PUSH_CRON = '*/20 * * * *';
+const subBootstrapSchema = z.object({
+  service: z.string().min(1),
+  serviceWatermark: z.literal(NCT_SUB_SERVICE_WATERMARK),
+  serviceUrl: z.string().url(),
+  subServiceEncryptionPublicKey: z.string().min(1),
+  reportedAt: z.string().min(1),
+});
+
+const subFormRecordsSchema = z.object({
+  serviceUrl: z.string().url(),
+  records: z
+    .array(
+      z.object({
+        databackFingerprint: z.string().min(1),
+        databackVersion: z.number().int().min(0),
+        payload: z
+          .record(z.string(), z.unknown())
+          .transform((value) => toJsonObject(value)),
+        recordKey: z.string().min(1),
+        updatedAt: z.string().min(1),
+      }),
+    )
+    .min(1),
+});
+
 const EXPORT_CRON = '0 18 * * *';
 
 const app = new Hono<{ Bindings: Env }>();
+
+function adminAuthErrorResponse(context: Context, error: unknown): Response {
+  if (error instanceof AdminAuthError) {
+    return context.json(
+      {
+        code: error.code,
+        error: error.message,
+      },
+      error.status as 400 | 401 | 409,
+    );
+  }
+
+  throw error;
+}
+
+async function assertIngestAuth(
+  context: Context<{ Bindings: Env }>,
+): Promise<Response | null> {
+  const ingestToken = context.env.INGEST_TOKEN?.trim();
+  if (ingestToken) {
+    return assertToken(
+      context,
+      ingestToken,
+      'Ingest',
+    );
+  }
+
+  return assertAdminAuth(context);
+}
+
+function readBearerToken(request: Request): string | null {
+  const authorization = request.headers.get('authorization');
+  if (authorization?.startsWith('Bearer ')) {
+    return authorization.slice('Bearer '.length).trim();
+  }
+
+  return request.headers.get('x-api-token')?.trim() || null;
+}
+
+function getSubAuthMaxFailures(env: Env): number {
+  return Math.max(
+    1,
+    Number(env.SUB_AUTH_MAX_FAILURES ?? '5'),
+  );
+}
 
 async function serveConsoleShell(context: {
   env: Env;
@@ -51,6 +139,7 @@ async function serveConsoleShell(context: {
     url: string;
   };
 }) {
+  // `/Console` is a client-side app, while `/` stays reserved for the public JSON dataset.
   const response = await context.env.ASSETS.fetch(
     new Request(new URL('/index.html', context.req.url)),
   );
@@ -74,7 +163,17 @@ app.use(
   '/api/*',
   cors({
     origin: '*',
-    allowHeaders: ['content-type', 'authorization', 'x-api-token'],
+    allowHeaders: [
+      'content-type',
+      'authorization',
+      'x-api-token',
+      'x-nct-auth-alg',
+      'x-nct-key-id',
+      'x-nct-timestamp',
+      'x-nct-nonce',
+      'x-nct-body-sha256',
+      'x-nct-signature',
+    ],
     allowMethods: ['GET', 'POST', 'OPTIONS'],
   }),
 );
@@ -107,11 +206,7 @@ app.get('/api/health', async (context) => {
 });
 
 app.post('/api/ingest', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.INGEST_TOKEN,
-    'Ingest',
-  );
+  const authError = await assertIngestAuth(context);
   if (authError) {
     return authError;
   }
@@ -129,6 +224,9 @@ app.post('/api/ingest', async (context) => {
   }
 
   const results = await ingestRecords(context.env, parsed.data.records);
+  if (results.some((item) => item.updated)) {
+    context.executionCtx?.waitUntil(pushSecureRecordsToRegisteredSubs(context.env));
+  }
 
   return context.json({
     message: 'Records ingested successfully.',
@@ -141,22 +239,61 @@ app.post('/api/sync', async (context) => {
   return context.json(
     {
       error:
-        'Deprecated. nct-api-sql no longer accepts downstream sync requests. Registered nct-api-sql-sub services are pushed by cron every 20 minutes.',
+        'Deprecated. Mother now pushes published secure records to registered sub services, and subs report their own status separately.',
     },
     410,
   );
 });
 
-app.post('/api/sub/report', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.SUB_REPORT_TOKEN,
-    'Sub report',
-  );
-  if (authError) {
-    return authError;
+app.post('/api/sub/bootstrap', async (context) => {
+  const payload = await context.req.json();
+  const parsed = subBootstrapSchema.safeParse(payload);
+  if (!parsed.success) {
+    return context.json(
+      {
+        error: 'Invalid sub bootstrap payload.',
+        details: parsed.error.flatten(),
+      },
+      400,
+    );
   }
 
+  if (!isRecognizedSubService(
+    parsed.data.service,
+    parsed.data.serviceWatermark,
+  )) {
+    return context.json(
+      {
+        error: 'Only nct-api-sql-sub bootstrap requests are accepted.',
+      },
+      403,
+    );
+  }
+
+  try {
+    const bootstrapped = await bootstrapSubServiceAuth(context.env, parsed.data);
+
+    return context.json(
+      await signPayloadEnvelope(context.env, {
+        accepted: true,
+        encryptedAuthToken: bootstrapped.encryptedAuthToken,
+        motherServiceEncryptionPublicKey: bootstrapped.motherServiceEncryptionPublicKey,
+        motherServicePublicKey: bootstrapped.motherServicePublicKey,
+        stored: bootstrapped.stored,
+      }),
+      202,
+    );
+  } catch (error) {
+    return context.json(
+      {
+        error: error instanceof Error ? error.message : 'Sub bootstrap failed.',
+      },
+      403,
+    );
+  }
+});
+
+app.post('/api/sub/report', async (context) => {
   const payload = await context.req.json();
   const parsed = subReportSchema.safeParse(payload);
   if (!parsed.success) {
@@ -169,7 +306,10 @@ app.post('/api/sub/report', async (context) => {
     );
   }
 
-  if (!isRecognizedSubService(parsed.data.service)) {
+  if (!isRecognizedSubService(
+    parsed.data.service,
+    parsed.data.serviceWatermark,
+  )) {
     return context.json(
       {
         error: 'Only nct-api-sql-sub reports are accepted.',
@@ -178,9 +318,26 @@ app.post('/api/sub/report', async (context) => {
     );
   }
 
-  const throttleState = await getSubReportThrottleState(
+  const tokenVerification = await verifySubServiceToken(
     context.env.DB,
     parsed.data.serviceUrl,
+    readBearerToken(context.req.raw),
+    getSubAuthMaxFailures(context.env),
+  );
+  if (!tokenVerification.ok) {
+    return context.json(
+      {
+        error: tokenVerification.reason,
+      },
+      tokenVerification.status,
+    );
+  }
+  const verifiedServiceUrl = tokenVerification.stored.serviceUrl?.trim()
+    || parsed.data.serviceUrl;
+
+  const throttleState = await getSubReportThrottleState(
+    context.env.DB,
+    verifiedServiceUrl,
     Math.max(0, Number(context.env.SUB_REPORT_MIN_INTERVAL_MS ?? '5000')),
   );
   if (throttleState) {
@@ -194,27 +351,85 @@ app.post('/api/sub/report', async (context) => {
     );
   }
 
-  const stored = await recordSubReport(context.env.DB, parsed.data);
+  const stored = await recordSubReport(context.env.DB, {
+    ...parsed.data,
+    serviceUrl: verifiedServiceUrl,
+  });
+  const motherServicePublicKey = context.env.SERVICE_SIGNING_PRIVATE_KEY
+    ? await deriveSigningPublicKeyFromPrivateKey(context.env.SERVICE_SIGNING_PRIVATE_KEY)
+    : null;
+  const motherServiceEncryptionPublicKey = context.env.SERVICE_ENCRYPTION_PRIVATE_KEY
+    ? await deriveEncryptionPublicKeyFromPrivateKey(context.env.SERVICE_ENCRYPTION_PRIVATE_KEY)
+    : null;
+  context.executionCtx?.waitUntil(pushSecureRecordsToRegisteredSubs(context.env));
 
   return context.json(
-    {
+    await signPayloadEnvelope(context.env, {
       accepted: true,
+      motherServiceEncryptionPublicKey,
+      motherServicePublicKey,
       stored,
-    },
+    }),
+    202,
+  );
+});
+
+app.post('/api/sub/form-records', async (context) => {
+  const payload = await context.req.json();
+  const parsed = subFormRecordsSchema.safeParse(payload);
+  if (!parsed.success) {
+    return context.json(
+      {
+        error: 'Invalid sub form sync payload.',
+        details: parsed.error.flatten(),
+      },
+      400,
+    );
+  }
+
+  const tokenVerification = await verifySubServiceToken(
+    context.env.DB,
+    parsed.data.serviceUrl,
+    readBearerToken(context.req.raw),
+    getSubAuthMaxFailures(context.env),
+  );
+  if (!tokenVerification.ok) {
+    return context.json(
+      {
+        error: tokenVerification.reason,
+      },
+      tokenVerification.status,
+    );
+  }
+  const verifiedServiceUrl = tokenVerification.stored.serviceUrl?.trim()
+    || parsed.data.serviceUrl;
+
+  const results = await ingestSubFormRecords(context.env, {
+    ...parsed.data,
+    serviceUrl: verifiedServiceUrl,
+  });
+  if (results.some((item) => item.updated)) {
+    context.executionCtx?.waitUntil(pushSecureRecordsToRegisteredSubs(context.env));
+  }
+  const motherServicePublicKey = context.env.SERVICE_SIGNING_PRIVATE_KEY
+    ? await deriveSigningPublicKeyFromPrivateKey(context.env.SERVICE_SIGNING_PRIVATE_KEY)
+    : null;
+  const motherServiceEncryptionPublicKey = context.env.SERVICE_ENCRYPTION_PRIVATE_KEY
+    ? await deriveEncryptionPublicKeyFromPrivateKey(context.env.SERVICE_ENCRYPTION_PRIVATE_KEY)
+    : null;
+
+  return context.json(
+    await signPayloadEnvelope(context.env, {
+      accepted: true,
+      motherServiceEncryptionPublicKey,
+      motherServicePublicKey,
+      results,
+    }),
     202,
   );
 });
 
 app.get('/api/public/secure-records', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.SYNC_TOKEN,
-    'Sync',
-  );
-  if (authError) {
-    return authError;
-  }
-
   const currentVersion = Number(
     context.req.query('currentVersion') ?? '0',
   );
@@ -229,15 +444,50 @@ app.get('/api/public/secure-records', async (context) => {
     mode,
   );
 
-  return context.json(payload);
+  return context.json(await signPayloadEnvelope(context.env, payload));
+});
+
+app.get('/api/admin/auth/status', async (context) => {
+  return context.json(await getAdminAuthStatus(context.env.DB));
+});
+
+app.post('/api/admin/auth/setup', async (context) => {
+  try {
+    const body = await context.req.json() as {
+      password?: unknown;
+    };
+
+    return context.json({
+      configured: true,
+      ...await setupAdminPassword(context.env.DB, body.password),
+    });
+  } catch (error) {
+    return adminAuthErrorResponse(context, error);
+  }
+});
+
+app.post('/api/admin/auth/login', async (context) => {
+  try {
+    const body = await context.req.json() as {
+      password?: unknown;
+    };
+
+    return context.json({
+      configured: true,
+      ...await loginAdminPassword(context.env.DB, body.password),
+    });
+  } catch (error) {
+    return adminAuthErrorResponse(context, error);
+  }
+});
+
+app.post('/api/admin/auth/logout', async (context) => {
+  await deleteAdminSession(context.env.DB, context.req.raw);
+  return context.body(null, 204);
 });
 
 app.get('/api/admin/snapshot', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.ADMIN_TOKEN,
-    'Admin',
-  );
+  const authError = await assertAdminAuth(context);
   if (authError) {
     return authError;
   }
@@ -246,16 +496,15 @@ app.get('/api/admin/snapshot', async (context) => {
 });
 
 app.post('/api/admin/rebuild-secure', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.ADMIN_TOKEN,
-    'Admin',
-  );
+  const authError = await assertAdminAuth(context);
   if (authError) {
     return authError;
   }
 
   const results = await rebuildSecureRecords(context.env);
+  if (results.some((item) => item.updated)) {
+    context.executionCtx?.waitUntil(pushSecureRecordsToRegisteredSubs(context.env));
+  }
 
   return context.json({
     message: 'Secure table rebuilt from raw records.',
@@ -266,11 +515,7 @@ app.post('/api/admin/rebuild-secure', async (context) => {
 });
 
 app.post('/api/admin/export-now', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.ADMIN_TOKEN,
-    'Admin',
-  );
+  const authError = await assertAdminAuth(context);
   if (authError) {
     return authError;
   }
@@ -283,11 +528,7 @@ app.post('/api/admin/export-now', async (context) => {
 });
 
 app.post('/api/admin/push-now', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.ADMIN_TOKEN,
-    'Admin',
-  );
+  const authError = await assertAdminAuth(context);
   if (authError) {
     return authError;
   }
@@ -295,25 +536,24 @@ app.post('/api/admin/push-now', async (context) => {
   const results = await pushSecureRecordsToRegisteredSubs(context.env);
   return context.json({
     message: 'Push run completed.',
-    totalTargets: results.length,
     pushedTargets: results.filter((item) => item.pushed).length,
+    totalTargets: results.length,
     results,
   });
 });
 
 app.post('/api/admin/pull-now', async (context) => {
-  const authError = assertToken(
-    context,
-    context.env.ADMIN_TOKEN,
-    'Admin',
-  );
+  const authError = await assertAdminAuth(context);
   if (authError) {
     return authError;
   }
 
   const results = await pullDatabackFromRegisteredSubs(context.env);
+  if (results.some((item) => item.pulled)) {
+    context.executionCtx?.waitUntil(pushSecureRecordsToRegisteredSubs(context.env));
+  }
   return context.json({
-    message: 'Pull run completed.',
+    message: 'Recovery pull run completed.',
     totalTargets: results.length,
     pulledTargets: results.filter((item) => item.pulled).length,
     results,
@@ -352,16 +592,6 @@ export default {
     env: Env,
     executionCtx: ExecutionContext,
   ) {
-    if (controller.cron === PUSH_CRON) {
-      executionCtx.waitUntil(
-        (async () => {
-          await pushSecureRecordsToRegisteredSubs(env);
-          await pullDatabackFromRegisteredSubs(env);
-        })(),
-      );
-      return;
-    }
-
     if (controller.cron === EXPORT_CRON) {
       executionCtx.waitUntil(exportSnapshot(env));
     }

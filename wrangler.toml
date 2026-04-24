@@ -25,10 +25,8 @@ preview_bucket_name = "nct-api-sql-exports-preview"
 [vars]
 APP_NAME = "NCT API SQL"
 DEFAULT_ENCRYPT_FIELDS = "name,phone,email,idCard"
-ENCRYPTION_KEY_VERSION = "1"
 EXPORT_EMAIL_TO = "ops@example.com"
 EXPORT_EMAIL_FROM = "NCT API SQL <exports@example.com>"
-EXPORT_TIMEZONE = "Asia/Shanghai"
 
 [triggers]
-crons = ["*/20 * * * *", "0 18 * * *"]
+crons = ["0 18 * * *"]

@@ -1,5 +1,5 @@
-import type { EncryptedEnvelope, JsonObject } from '../../shared/types';
-import { parseJsonObject, stableStringify } from './json';
+import type { EncryptedEnvelope, JsonObject, RsaOaepEncryptedEnvelope } from '../../shared/types';
+import { stableStringify } from './json';
 
 const encoder = new TextEncoder();
 
@@ -23,6 +23,26 @@ function base64ToBytes(value: string): Uint8Array {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
+function readPemBody(value: string): string {
+  return String(value || '')
+    .trim()
+    .replace(/\\n/g, '\n')
+    .replace(/-----BEGIN [^-]+-----/g, '')
+    .replace(/-----END [^-]+-----/g, '')
+    .replace(/\s+/g, '');
+}
+
+function bytesToPem(bytes: Uint8Array, label: string): string {
+  const base64 = bytesToBase64(bytes);
+  const chunks = base64.match(/.{1,64}/g) ?? [];
+
+  return [
+    `-----BEGIN ${label}-----`,
+    ...chunks,
+    `-----END ${label}-----`,
+  ].join('\n');
+}
+
 async function importAesKey(
   secret: string,
   usages: KeyUsage[],
@@ -38,6 +58,37 @@ async function importAesKey(
     { name: 'AES-GCM' },
     false,
     usages,
+  );
+}
+
+async function importRsaEncryptionPublicKey(
+  publicKey: string,
+): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'spki',
+    toArrayBuffer(base64ToBytes(readPemBody(publicKey))),
+    {
+      name: 'RSA-OAEP',
+      hash: 'SHA-256',
+    },
+    false,
+    ['encrypt'],
+  );
+}
+
+async function importRsaEncryptionPrivateKey(
+  privateKey: string,
+  extractable = false,
+): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'pkcs8',
+    toArrayBuffer(base64ToBytes(readPemBody(privateKey))),
+    {
+      name: 'RSA-OAEP',
+      hash: 'SHA-256',
+    },
+    extractable,
+    ['decrypt'],
   );
 }
 
@@ -91,6 +142,113 @@ export async function decryptObject(
     toArrayBuffer(base64ToBytes(envelope.ciphertext)),
   );
 
-  const decoded = new TextDecoder().decode(new Uint8Array(plaintext));
-  return parseJsonObject(decoded);
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(plaintext))) as JsonObject;
+}
+
+export async function deriveEncryptionPublicKeyFromPrivateKey(
+  privateKey: string,
+): Promise<string> {
+  const importedPrivateKey = await importRsaEncryptionPrivateKey(privateKey, true);
+  const exportedJwk = await crypto.subtle.exportKey(
+    'jwk',
+    importedPrivateKey,
+  ) as JsonWebKey;
+
+  if (
+    exportedJwk.kty !== 'RSA'
+    || typeof exportedJwk.n !== 'string'
+    || typeof exportedJwk.e !== 'string'
+  ) {
+    throw new Error('SERVICE_ENCRYPTION_PRIVATE_KEY is not a valid RSA private key.');
+  }
+
+  const publicKey = await crypto.subtle.importKey(
+    'jwk',
+    {
+      alg: 'RSA-OAEP-256',
+      e: exportedJwk.e,
+      ext: true,
+      key_ops: ['encrypt'],
+      kty: 'RSA',
+      n: exportedJwk.n,
+    },
+    {
+      name: 'RSA-OAEP',
+      hash: 'SHA-256',
+    },
+    true,
+    ['encrypt'],
+  );
+  const spki = await crypto.subtle.exportKey('spki', publicKey) as ArrayBuffer;
+
+  return bytesToPem(new Uint8Array(spki), 'PUBLIC KEY');
+}
+
+export async function encryptJsonWithPublicKey(
+  value: unknown,
+  publicKey: string,
+): Promise<RsaOaepEncryptedEnvelope> {
+  const aesKey = crypto.getRandomValues(new Uint8Array(32));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const contentKey = await crypto.subtle.importKey(
+    'raw',
+    toArrayBuffer(aesKey),
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt'],
+  );
+  const ciphertext = await crypto.subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv: toArrayBuffer(iv),
+    },
+    contentKey,
+    toArrayBuffer(encoder.encode(stableStringify(value))),
+  );
+  const recipientKey = await importRsaEncryptionPublicKey(publicKey);
+  const encryptedKey = await crypto.subtle.encrypt(
+    {
+      name: 'RSA-OAEP',
+    },
+    recipientKey,
+    toArrayBuffer(aesKey),
+  );
+
+  return {
+    algorithm: 'RSA-OAEP-SHA-256+A256GCM',
+    encryptedKey: bytesToBase64(new Uint8Array(encryptedKey)),
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(ciphertext)),
+  };
+}
+
+export async function decryptJsonWithPrivateKey<T = unknown>(
+  envelope: RsaOaepEncryptedEnvelope,
+  privateKey: string,
+): Promise<T> {
+  const recipientKey = await importRsaEncryptionPrivateKey(privateKey);
+  const decryptedKey = await crypto.subtle.decrypt(
+    {
+      name: 'RSA-OAEP',
+    },
+    recipientKey,
+    toArrayBuffer(base64ToBytes(envelope.encryptedKey)),
+  );
+  const contentKey = await crypto.subtle.importKey(
+    'raw',
+    decryptedKey,
+    { name: 'AES-GCM' },
+    false,
+    ['decrypt'],
+  );
+  const plaintext = await crypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: toArrayBuffer(base64ToBytes(envelope.iv)),
+    },
+    contentKey,
+    toArrayBuffer(base64ToBytes(envelope.ciphertext)),
+  );
+
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(plaintext))) as T;
 }

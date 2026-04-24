@@ -5,9 +5,18 @@ import { apiRequest } from './api';
 const AnalyticsSection = lazy(() => import('./AnalyticsSection'));
 
 const STORAGE_KEYS = {
-  admin: 'nct-api-sql-admin-token',
+  adminSession: 'nct-api-sql-admin-session',
   ingest: 'nct-api-sql-ingest-token',
 } as const;
+
+type AdminAuthStatus = {
+  configured: boolean;
+};
+
+type AdminAuthResponse = AdminAuthStatus & {
+  expiresAt: string;
+  sessionToken: string;
+};
 
 const sampleIngestPayload = JSON.stringify(
   {
@@ -126,15 +135,26 @@ export default function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [message, setMessage] = useState<string>('Console ready.');
   const [error, setError] = useState<string | null>(null);
-  const [adminToken, setAdminToken] = useState(
-    () => localStorage.getItem(STORAGE_KEYS.admin) ?? '',
+  const [adminConfigured, setAdminConfigured] = useState<boolean | null>(null);
+  const [adminPassword, setAdminPassword] = useState('');
+  const [adminSessionToken, setAdminSessionToken] = useState(
+    () => localStorage.getItem(STORAGE_KEYS.adminSession) ?? '',
   );
   const [ingestToken, setIngestToken] = useState(
     () => localStorage.getItem(STORAGE_KEYS.ingest) ?? '',
   );
   const [ingestPayload, setIngestPayload] = useState(sampleIngestPayload);
 
-  async function loadSnapshot() {
+  async function loadSnapshot(token = adminSessionToken) {
+    if (!token) {
+      setSnapshot(null);
+      setLoading(false);
+      if (adminConfigured) {
+        setError('Log in to load the admin snapshot.');
+      }
+      return;
+    }
+
     setLoading(true);
     setError(null);
 
@@ -142,7 +162,7 @@ export default function App() {
       const nextSnapshot = await apiRequest<AdminSnapshot>(
         '/api/admin/snapshot',
         {
-          token: adminToken || undefined,
+          token,
         },
       );
       setSnapshot(nextSnapshot);
@@ -156,16 +176,90 @@ export default function App() {
   }
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.admin, adminToken);
-  }, [adminToken]);
+    localStorage.setItem(STORAGE_KEYS.adminSession, adminSessionToken);
+  }, [adminSessionToken]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.ingest, ingestToken);
   }, [ingestToken]);
 
   useEffect(() => {
-    void loadSnapshot();
+    async function initializeConsole() {
+      setLoading(true);
+      setError(null);
+
+      try {
+        const status = await apiRequest<AdminAuthStatus>('/api/admin/auth/status');
+        setAdminConfigured(status.configured);
+
+        if (!status.configured) {
+          setSnapshot(null);
+          setMessage('Set the first admin password to initialize Console access.');
+          return;
+        }
+
+        if (adminSessionToken) {
+          await loadSnapshot(adminSessionToken);
+          return;
+        }
+
+        setSnapshot(null);
+        setMessage('Log in to load the admin snapshot.');
+      } catch (initializeError) {
+        const nextError =
+          initializeError instanceof Error
+            ? initializeError.message
+            : 'Failed to initialize Console.';
+        setError(nextError);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    void initializeConsole();
   }, []);
+
+  async function handleAdminAuthSubmit(
+    event: React.FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+    await runAction(adminConfigured ? 'Login' : 'Setup admin password', async () => {
+      const response = await apiRequest<AdminAuthResponse>(
+        adminConfigured ? '/api/admin/auth/login' : '/api/admin/auth/setup',
+        {
+          method: 'POST',
+          body: {
+            password: adminPassword,
+          },
+        },
+      );
+
+      setAdminConfigured(true);
+      setAdminPassword('');
+      setAdminSessionToken(response.sessionToken);
+      setMessage(`Admin session active until ${response.expiresAt}.`);
+      await loadSnapshot(response.sessionToken);
+    });
+  }
+
+  async function handleLogout() {
+    const token = adminSessionToken;
+    setAdminSessionToken('');
+    setSnapshot(null);
+    setMessage('Logged out.');
+    if (!token) {
+      return;
+    }
+
+    try {
+      await apiRequest<null>('/api/admin/auth/logout', {
+        method: 'POST',
+        token,
+      });
+    } catch (_error) {
+      // Local logout should still complete if the server session has already expired.
+    }
+  }
 
   async function runAction(
     actionName: string,
@@ -196,7 +290,7 @@ export default function App() {
         updatedCount: number;
       }>('/api/ingest', {
         method: 'POST',
-        token: ingestToken || adminToken || undefined,
+        token: ingestToken || adminSessionToken || undefined,
         body: parsedBody,
       });
       setMessage(`Ingest completed. ${response.updatedCount} record(s) changed.`);
@@ -211,7 +305,7 @@ export default function App() {
         updated: number;
       }>('/api/admin/rebuild-secure', {
         method: 'POST',
-        token: adminToken || undefined,
+        token: adminSessionToken || undefined,
       });
       setMessage(
         `Rebuild completed. processed=${response.processed}, updated=${response.updated}.`,
@@ -227,7 +321,7 @@ export default function App() {
         emailStatus: string;
       }>('/api/admin/export-now', {
         method: 'POST',
-        token: adminToken || undefined,
+        token: adminSessionToken || undefined,
       });
       setMessage(
         `Export archived to ${response.objectKey}. Email=${response.emailStatus}.`,
@@ -235,17 +329,17 @@ export default function App() {
     });
   }
 
-  async function handlePushNow() {
-    await runAction('Push', async () => {
+  async function handlePullNow() {
+    await runAction('Recovery pull', async () => {
       const response = await apiRequest<{
         totalTargets: number;
-        pushedTargets: number;
-      }>('/api/admin/push-now', {
+        pulledTargets: number;
+      }>('/api/admin/pull-now', {
         method: 'POST',
-        token: adminToken || undefined,
+        token: adminSessionToken || undefined,
       });
       setMessage(
-        `Push completed. targets=${response.totalTargets}, pushed=${response.pushedTargets}.`,
+        `Recovery pull completed. targets=${response.totalTargets}, pulled=${response.pulledTargets}.`,
       );
       await loadSnapshot();
     });
@@ -300,14 +394,18 @@ export default function App() {
           </p>
         </div>
         <div className="hero-actions">
-          <div className="token-grid">
+          <form className="token-grid" onSubmit={handleAdminAuthSubmit}>
             <label className="token-field">
-              <span>Admin token</span>
+              <span>{adminConfigured ? 'Admin password' : 'Set admin password'}</span>
               <input
                 type="password"
-                value={adminToken}
-                onChange={(event) => setAdminToken(event.target.value)}
-                placeholder="Used by snapshot/export/rebuild"
+                value={adminPassword}
+                onChange={(event) => setAdminPassword(event.target.value)}
+                placeholder={
+                  adminConfigured
+                    ? 'Log in to manage data'
+                    : 'At least 12 characters'
+                }
               />
             </label>
             <label className="token-field">
@@ -316,24 +414,47 @@ export default function App() {
                 type="password"
                 value={ingestToken}
                 onChange={(event) => setIngestToken(event.target.value)}
-                placeholder="Blank means fallback to admin token"
+                placeholder="Optional external ingest token"
               />
             </label>
             <label className="token-field">
-              <span>Push mode</span>
+              <span>Admin session</span>
               <input
-                value="Cron every 20 minutes"
+                value={
+                  adminSessionToken
+                    ? 'Active'
+                    : adminConfigured === false
+                      ? 'Password not set'
+                      : 'Login required'
+                }
                 readOnly
-                placeholder="Cron every 20 minutes"
+                placeholder="Login required"
               />
             </label>
-          </div>
+            <div className="auth-actions">
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={busyAction !== null || !adminPassword || adminConfigured === null}
+              >
+                {adminConfigured ? 'Log in' : 'Set password'}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void handleLogout()}
+                disabled={!adminSessionToken || busyAction !== null}
+              >
+                Log out
+              </button>
+            </div>
+          </form>
           <div className="action-row">
             <button
               type="button"
               className="primary-button"
               onClick={() => void loadSnapshot()}
-              disabled={loading || busyAction !== null}
+              disabled={loading || busyAction !== null || !adminSessionToken}
             >
               {loading ? 'Refreshing...' : 'Refresh snapshot'}
             </button>
@@ -341,7 +462,7 @@ export default function App() {
               type="button"
               className="secondary-button"
               onClick={() => void handleRebuild()}
-              disabled={busyAction !== null}
+              disabled={busyAction !== null || !adminSessionToken}
             >
               Rebuild secure table
             </button>
@@ -349,17 +470,17 @@ export default function App() {
               type="button"
               className="secondary-button"
               onClick={() => void handleExport()}
-              disabled={busyAction !== null}
+              disabled={busyAction !== null || !adminSessionToken}
             >
               Export + email
             </button>
             <button
               type="button"
               className="secondary-button"
-              onClick={() => void handlePushNow()}
-              disabled={busyAction !== null}
+              onClick={() => void handlePullNow()}
+              disabled={busyAction !== null || !adminSessionToken}
             >
-              Push sub services now
+              Recovery pull from subs
             </button>
           </div>
           <div className="status-strip">
@@ -381,12 +502,12 @@ export default function App() {
           <MetricCard
             label="Secure records"
             value={overview?.totals.secureRecords ?? 0}
-            helper="部分列加密后用于主动推送到子库"
+            helper="部分列加密后供子库主动拉取"
           />
           <MetricCard
             label="Third table rows"
             value={overview?.totals.downstreamClients ?? 0}
-            helper="记录子库上报与最近推送状态"
+            helper="记录子库上报与最近恢复状态"
           />
           <MetricCard
             label="Current version"
@@ -412,8 +533,8 @@ export default function App() {
         <section className="glass-panel form-panel">
           <SectionTitle
             eyebrow="Debug"
-            title="数据写入与主动推送调试"
-            description="直接验证 ingest、加密构建，以及向已登记子库执行手动推送。"
+            title="数据写入与灾备调试"
+            description="直接验证 ingest、加密构建，以及从已登记子库执行一次手动恢复回拉。"
           />
           <div className="form-grid">
             <form className="action-form" onSubmit={handleIngestSubmit}>
@@ -426,26 +547,26 @@ export default function App() {
               <button
                 type="submit"
                 className="primary-button"
-                disabled={busyAction !== null}
+                disabled={busyAction !== null || (!ingestToken && !adminSessionToken)}
               >
                 Send ingest
               </button>
             </form>
 
             <div className="action-form">
-              <h3>POST /api/admin/push-now</h3>
+              <h3>POST /api/admin/pull-now</h3>
               <p>
-                主库不再接收下游拉取请求。已在第三张表登记的
-                `nct-api-sql-sub` 会由 cron 每 20 分钟主动推送，
-                也可以在这里手动触发一次。
+                `nct-api-sql-sub` 会按自己的计划主动拉取主库公开数据并定时上报。
+                这里保留的接口只用于灾备演练或母库恢复时，从已登记子库手动回拉最新
+                `nct_databack`。
               </p>
               <button
                 type="button"
                 className="primary-button"
-                onClick={() => void handlePushNow()}
-                disabled={busyAction !== null}
+                onClick={() => void handlePullNow()}
+                disabled={busyAction !== null || !adminSessionToken}
               >
-                Trigger push
+                Trigger recovery pull
               </button>
             </div>
           </div>
