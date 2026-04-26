@@ -352,6 +352,31 @@ npm run deploy
 
 部署后首次打开 `https://api.example.com/Console` 设置管理员密码。
 
+### 5. Cloudflare Dashboard 网页端部署
+
+如果希望主要在 Cloudflare 网页上完成部署，可以使用 Workers Builds 连接 Git 仓库。网页部署仍会读取本目录的 [`wrangler.toml`](./wrangler.toml)，因此先确认 `name = "nct-api-sql"`、`main = "src/worker/index.ts"`、`[assets]`、Cron、D1 和 R2 绑定都已提交到仓库；不要把示例里的 `database_id = "00000000-0000-0000-0000-000000000000"` 留在线上配置中。
+
+推荐步骤：
+
+1. 在 Cloudflare Dashboard 进入 `Workers & Pages`，创建或选择名为 `nct-api-sql` 的 Worker。
+2. 打开该 Worker 的 `Settings` -> `Builds`，选择 `Connect`，连接 GitHub / GitLab 仓库。
+3. 构建设置按项目位置填写：
+   - Repository root 如果是整个 `nct` 仓库，Root directory 填 `NCT_database`；如果本项目是独立仓库，留空或填 `/`。
+   - Production branch 填实际生产分支，例如 `main`。
+   - Build command 填 `npm run check && npm run build`。
+   - Deploy command 填 `npx wrangler deploy`。
+4. 在 `D1 SQL database` 页面创建数据库 `nct-api-sql`，复制数据库 ID，写回并提交 [`wrangler.toml`](./wrangler.toml) 的 `[[d1_databases]]`；也可以在 Worker 的 `Settings` -> `Bindings` 手动添加 `D1 database` 绑定，变量名必须是 `DB`。
+5. 在 `R2` 页面创建 `nct-api-sql-exports` 和 `nct-api-sql-exports-preview` 两个 bucket，并在 Worker 的 `Settings` -> `Bindings` 确认 `R2 bucket` 绑定变量名为 `EXPORT_BUCKET`。
+6. 在 D1 数据库的 `Console` 中按文件名顺序执行 [`migrations`](./migrations) 里的 SQL。更稳妥的方式仍是在本地执行 `npm run db:migrate:remote`，避免漏跑某个 migration。
+7. 在 Worker 的 `Settings` -> `Variables and Secrets` 中添加生产配置：
+   - Variables：`APP_NAME`、`DEFAULT_ENCRYPT_FIELDS`、`EXPORT_EMAIL_TO`、`EXPORT_EMAIL_FROM`、`SUB_AUTH_MAX_FAILURES`、`SUB_REPORT_MIN_INTERVAL_MS`、`SUB_PULL_BATCH_SIZE`、`SUB_PULL_RECORD_LIMIT`、`SUB_PULL_TIMEOUT_MS`
+   - Secrets：`ENCRYPTION_KEY`、`INGEST_TOKEN`、`SERVICE_SIGNING_PRIVATE_KEY`、`SERVICE_ENCRYPTION_PRIVATE_KEY`、`RESEND_API_KEY`
+8. 在 `Settings` -> `Triggers` 确认 Cron 触发器包含 `0 18 * * *`。
+9. 在 `Settings` -> `Domains & Routes` -> `Add` -> `Custom Domain` 绑定 `api.example.com`。
+10. 推送一个提交触发 Workers Builds。部署成功后打开 `https://api.example.com/Console` 设置管理员密码，再检查 `https://api.example.com/api/health` 和 `https://api.example.com/`。
+
+Cloudflare 官方参考：[`Workers Builds`](https://developers.cloudflare.com/workers/ci-cd/builds/)、[`Workers Static Assets`](https://developers.cloudflare.com/workers/static-assets/)、[`D1 Dashboard`](https://developers.cloudflare.com/d1/get-started/)、[`R2 Buckets`](https://developers.cloudflare.com/r2/buckets/create-buckets/)、[`Variables and Secrets`](https://developers.cloudflare.com/workers/configuration/secrets/)、[`Custom Domains`](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)。
+
 ### 生产访问约定
 
 假设你的自定义域名是 `https://api.example.com`，则：
