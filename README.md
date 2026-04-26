@@ -154,41 +154,38 @@ openssl rand -base64 32
 - 绝对必填：`ENCRYPTION_KEY`
 - 平台绑定必填但不写进 `.env`：`DB`、`ASSETS`、`EXPORT_BUCKET`，在 [`wrangler.toml`](./wrangler.toml) 中绑定 D1、静态资产和 R2
 - 管理台密码不再通过环境变量配置；部署后首次打开 `/Console` 设置
-- 外部写入源调用 `/api/ingest` 时建议设置：`INGEST_TOKEN`
-- 与 `nct-api-sql-sub` 联动时强烈建议视为必填：`SERVICE_SIGNING_PRIVATE_KEY`
 - 按功能必填：`RESEND_API_KEY`、`EXPORT_EMAIL_TO`、`EXPORT_EMAIL_FROM` 仅在你要启用邮件导出时需要
 
-把生成的 base64 值写入 `ENCRYPTION_KEY`。服务间调用优先使用 ECDSA P-256 请求签名：
+把生成的 base64 值写入 `ENCRYPTION_KEY`。服务间调用统一使用子库 `serviceUrl` 派生的 30 秒 HMAC Bearer token：
 
-- 母库自己的 `SERVICE_SIGNING_PRIVATE_KEY` 用于签名母库回拉子库请求，以及签名 `GET /api/public/secure-records` 返回的 payload envelope
-- 母库返回给子库的 `GET /api/public/secure-records` payload 现在只做签名；记录里的 `encryptedData` 仍然是母库 t2 字段密文
-- 母库会在接受子库上报后，把自己的签名公钥自动返回给子库缓存；子库后续据此识别母库身份
+- 子库首次成功 `POST /api/sub/report` 即完成登记，母库保存 `sha256(serviceUrl)` 用于后续校验
+- 子库上报、表单回传、母库推送 secure records、母库灾备回拉都按相同 30 秒窗口派生 token
+- `GET /api/public/secure-records` 返回公开 payload，不再包 signed envelope；记录里的 `encryptedData` 仍然是母库 t2 字段密文
 - 母库不再要求子库回传数据时做额外字段加密；子库本地普通 JSON 回传后，由母库按自身 `ENCRYPTION_KEY` 重新生成 t2
 
 下面这些变量不是鉴权凭据，而是 mother/sub 同步调优项：
 
 - `SUB_REPORT_MIN_INTERVAL_MS`
 - `SUB_PULL_BATCH_SIZE`
+- `SUB_PULL_MAX_ATTEMPTS`
 - `SUB_PULL_RECORD_LIMIT`
+- `SUB_PULL_RETRY_DELAY_MS`
 - `SUB_PULL_TIMEOUT_MS`
 
 管理台首次打开时会把你设置的管理员密码哈希写入 D1，之后登录会得到短期 session token。
-如果 `INGEST_TOKEN` 留空，`/api/ingest` 只接受已登录管理台 session；如果要让外部程序推送数据，应单独设置 `INGEST_TOKEN`。
-新链路中，母库主要负责：
-签名 `GET /api/public/secure-records` 的响应，
-以及签名 `nct-api-sql -> nct-api-sql-sub` 的灾备回拉请求。
+`/api/ingest` 只接受已登录管理台 session，不再接受外部 `INGEST_TOKEN` Bearer 写入；母子库之间的数据同步走 `/api/sub/*`、`/api/push/secure-records` 和 `/api/export/nct_databack`。
+新链路中不再有单独 bootstrap。双方直接以子库 `serviceUrl` 作为 verification seed，按 `NCT-MOTHER-AUTH-HMAC-SHA256-T30-V1` 每 30 秒派生短期 Bearer token，并用相邻时间窗口复算验证。无法验证的 report / form-records 请求会收到伪成功响应，但母库不落库、不触发推送。母库推送 `POST /api/push/secure-records` 和灾备回拉 `GET /api/export/nct_databack` 也带同样的 Bearer token；`nct_databack` 导出文件明文传输，不再使用 proof 字段。
 `SUB_REPORT_MIN_INTERVAL_MS` 用于限制主库接收子库上报的最小时间间隔。
 `SUB_PULL_BATCH_SIZE` 表示每轮最多处理多少个已登记子库。
 `SUB_PULL_RECORD_LIMIT` 表示每次从单个子库拉取多少条 `nct_databack` 记录。
+`SUB_PULL_MAX_ATTEMPTS` 表示单次子库导出请求最多连续尝试多少次，默认 5。
+`SUB_PULL_RETRY_DELAY_MS` 表示失败后再次请求同一子库导出文件前等待多久，默认 60000 毫秒。
 `SUB_PULL_TIMEOUT_MS` 表示主库请求子库导出文件时的超时时间。
 
 生成推荐密钥的最小命令：
 
 ```bash
-# 服务请求签名。母库保存私钥，子库会在首次成功上报后缓存母库公钥。
-openssl ecparam -name prime256v1 -genkey -noout -out mother-signing.key
-openssl pkcs8 -topk8 -nocrypt -in mother-signing.key -out mother-signing.pkcs8.pem
-npm run key:derive-public -- ./mother-signing.pkcs8.pem > mother-signing.pub.pem
+openssl rand -base64 32
 ```
 
 ### 4. 执行 D1 migration
@@ -232,7 +229,7 @@ npx wrangler d1 migrations apply DB --local --persist-to .wrangler/state
 
 也就是说，只要你执行一次 `npm run dev`，本地调试 D1 库就会被自动建立好。
 
-注意：Cloudflare Workers 在生产环境不是传统“监听自定义端口”的模式，因此这里用的是 HTTP API 入口 `POST /api/ingest` 来承接下游写入。
+注意：Cloudflare Workers 在生产环境不是传统“监听自定义端口”的模式；`POST /api/ingest` 只作为管理台登录态下的手动写入入口，不再承接外部 token 写入。
 
 ### 动态扩列规则
 
@@ -304,27 +301,10 @@ custom_domain = true
 openssl rand -base64 32
 ```
 
-生成服务签名私钥：
-
-```bash
-openssl ecparam -name prime256v1 -genkey -noout -out mother-signing.key
-openssl pkcs8 -topk8 -nocrypt -in mother-signing.key -out mother-signing.pkcs8.pem
-npm run key:derive-public -- ./mother-signing.pkcs8.pem > mother-signing.pub.pem
-```
-
-生成服务加密私钥：
-
-```bash
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out mother-encryption.pkcs8.pem
-```
-
 写入 Cloudflare Secrets：
 
 ```bash
 npx wrangler secret put ENCRYPTION_KEY
-npx wrangler secret put INGEST_TOKEN
-npx wrangler secret put SERVICE_SIGNING_PRIVATE_KEY
-npx wrangler secret put SERVICE_ENCRYPTION_PRIVATE_KEY
 ```
 
 按功能可选：
@@ -336,9 +316,6 @@ npx wrangler secret put RESEND_API_KEY
 说明：
 
 - `ENCRYPTION_KEY` 使用上面生成的 base64 值。
-- `INGEST_TOKEN` 保护 `POST /api/ingest`；留空时只接受 Console 管理员 session。
-- `SERVICE_SIGNING_PRIVATE_KEY` 粘贴 `mother-signing.pkcs8.pem` 内容。
-- `SERVICE_ENCRYPTION_PRIVATE_KEY` 粘贴 `mother-encryption.pkcs8.pem` 内容。
 - `EXPORT_EMAIL_TO` 和 `EXPORT_EMAIL_FROM` 可以放在 `[vars]`，也可以作为 Secrets。
 
 ### 4. 远端迁移并部署
@@ -369,8 +346,8 @@ npm run deploy
 5. 在 `R2` 页面创建 `nct-api-sql-exports` 和 `nct-api-sql-exports-preview` 两个 bucket，并在 Worker 的 `Settings` -> `Bindings` 确认 `R2 bucket` 绑定变量名为 `EXPORT_BUCKET`。
 6. 在 D1 数据库的 `Console` 中按文件名顺序执行 [`migrations`](./migrations) 里的 SQL。更稳妥的方式仍是在本地执行 `npm run db:migrate:remote`，避免漏跑某个 migration。
 7. 在 Worker 的 `Settings` -> `Variables and Secrets` 中添加生产配置：
-   - Variables：`APP_NAME`、`DEFAULT_ENCRYPT_FIELDS`、`EXPORT_EMAIL_TO`、`EXPORT_EMAIL_FROM`、`SUB_AUTH_MAX_FAILURES`、`SUB_REPORT_MIN_INTERVAL_MS`、`SUB_PULL_BATCH_SIZE`、`SUB_PULL_RECORD_LIMIT`、`SUB_PULL_TIMEOUT_MS`
-   - Secrets：`ENCRYPTION_KEY`、`INGEST_TOKEN`、`SERVICE_SIGNING_PRIVATE_KEY`、`SERVICE_ENCRYPTION_PRIVATE_KEY`、`RESEND_API_KEY`
+   - Variables：`APP_NAME`、`DEFAULT_ENCRYPT_FIELDS`、`EXPORT_EMAIL_TO`、`EXPORT_EMAIL_FROM`、`SUB_AUTH_MAX_FAILURES`、`SUB_REPORT_MIN_INTERVAL_MS`、`SUB_PULL_BATCH_SIZE`、`SUB_PULL_MAX_ATTEMPTS`、`SUB_PULL_RECORD_LIMIT`、`SUB_PULL_RETRY_DELAY_MS`、`SUB_PULL_TIMEOUT_MS`
+   - Secrets：`ENCRYPTION_KEY`、`RESEND_API_KEY`
 8. 在 `Settings` -> `Triggers` 确认 Cron 触发器包含 `0 18 * * *`。
 9. 在 `Settings` -> `Domains & Routes` -> `Add` -> `Custom Domain` 绑定 `api.example.com`。
 10. 推送一个提交触发 Workers Builds。部署成功后打开 `https://api.example.com/Console` 设置管理员密码，再检查 `https://api.example.com/api/health` 和 `https://api.example.com/`。
@@ -410,12 +387,12 @@ Cloudflare 官方参考：[`Workers Builds`](https://developers.cloudflare.com/w
 
 ### 写入原始数据
 
-本地开发示例：
+`/api/ingest` 现在只给管理台登录态使用，外部 Bearer token 写入已关闭。本地开发示例：
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/ingest \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_INGEST_TOKEN" \
+  -H "Authorization: Bearer YOUR_CONSOLE_SESSION_TOKEN" \
   -d '{
     "records": [
       {
@@ -440,7 +417,7 @@ curl -X POST http://127.0.0.1:8787/api/ingest \
 ```bash
 curl -X POST https://api.example.com/api/ingest \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_INGEST_TOKEN" \
+  -H "Authorization: Bearer YOUR_CONSOLE_SESSION_TOKEN" \
   -d '{
     "records": [
       {
@@ -470,11 +447,12 @@ curl -X POST https://api.example.com/api/admin/pull-now \
 ### 子库上报
 
 `/api/sub/report` 只接受 `nct-api-sql-sub` 的上报，其他 `service` 会被拒绝。
-母库识别 `serviceWatermark` 后，会在响应里返回自己的签名公钥，供子库缓存。
+母库识别 `serviceWatermark` 后，会用 `serviceUrl` 派生的 30 秒 HMAC Bearer token 验证请求；首次验证成功会登记该子库。
 
 ```bash
 curl -X POST https://api.example.com/api/sub/report \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer SERVICE_URL_DERIVED_30S_HMAC" \
   -d '{
     "service": "NCT API SQL Sub",
     "serviceWatermark": "nct-api-sql-sub:v1",

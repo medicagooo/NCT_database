@@ -1,29 +1,60 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const {
+  assertAdminAuthMock,
+  ingestSubFormRecordsMock,
   ingestRecordsMock,
+  isRecognizedSubServiceMock,
   pushSecureRecordsToRegisteredSubsMock,
+  recordSubReportMock,
+  verifySubServiceTokenMock,
 } = vi.hoisted(() => ({
+  assertAdminAuthMock: vi.fn(),
+  ingestSubFormRecordsMock: vi.fn(),
   ingestRecordsMock: vi.fn(),
+  isRecognizedSubServiceMock: vi.fn(),
   pushSecureRecordsToRegisteredSubsMock: vi.fn(),
+  recordSubReportMock: vi.fn(),
+  verifySubServiceTokenMock: vi.fn(),
 }));
 
 vi.mock('./lib/data', () => ({
   NCT_SUB_SERVICE_WATERMARK: 'nct-api-sql-sub:v1',
-  bootstrapSubServiceAuth: vi.fn(),
   getAdminSnapshot: vi.fn(),
   getPublicDataset: vi.fn(),
   getPublishedPayload: vi.fn(),
   getSubReportThrottleState: vi.fn(),
   ingestRecords: ingestRecordsMock,
-  ingestSubFormRecords: vi.fn(),
-  isRecognizedSubService: vi.fn(),
+  ingestSubFormRecords: ingestSubFormRecordsMock,
+  isRecognizedSubService: isRecognizedSubServiceMock,
   pullDatabackFromRegisteredSubs: vi.fn(),
   pushSecureRecordsToRegisteredSubs: pushSecureRecordsToRegisteredSubsMock,
   rebuildSecureRecords: vi.fn(),
-  recordSubReport: vi.fn(),
-  verifySubServiceToken: vi.fn(),
+  recordSubReport: recordSubReportMock,
+  verifySubServiceToken: verifySubServiceTokenMock,
 }));
+
+vi.mock('./lib/adminAuth', () => {
+  class AdminAuthError extends Error {
+    code: string;
+    status: number;
+
+    constructor(status: number, code: string, message: string) {
+      super(message);
+      this.code = code;
+      this.status = status;
+    }
+  }
+
+  return {
+    AdminAuthError,
+    assertAdminAuth: assertAdminAuthMock,
+    deleteAdminSession: vi.fn(),
+    getAdminAuthStatus: vi.fn(),
+    loginAdminPassword: vi.fn(),
+    setupAdminPassword: vi.fn(),
+  };
+});
 
 import worker from './index';
 
@@ -46,14 +77,13 @@ describe('/api/ingest', () => {
         totalRecords: 1,
       },
     ]);
-    const env = {
-      INGEST_TOKEN: 'ingest-secret',
-    } as Env;
+    const env = {} as Env;
     const executionCtx = {
       passThroughOnException: vi.fn(),
       waitUntil: vi.fn(),
     } as unknown as ExecutionContext;
 
+    assertAdminAuthMock.mockResolvedValue(null);
     ingestRecordsMock.mockResolvedValue([
       {
         fingerprint: 'fingerprint-1',
@@ -80,7 +110,6 @@ describe('/api/ingest', () => {
           ],
         }),
         headers: {
-          authorization: 'Bearer ingest-secret',
           'content-type': 'application/json',
         },
         method: 'POST',
@@ -94,6 +123,7 @@ describe('/api/ingest', () => {
 
     expect(response.status).toBe(200);
     expect(body.updatedCount).toBe(1);
+    expect(assertAdminAuthMock).toHaveBeenCalled();
     expect(ingestRecordsMock).toHaveBeenCalledWith(env, [
       {
         payload: {
@@ -105,5 +135,119 @@ describe('/api/ingest', () => {
     ]);
     expect(pushSecureRecordsToRegisteredSubsMock).toHaveBeenCalledWith(env);
     expect(executionCtx.waitUntil).toHaveBeenCalledWith(pushPromise);
+  });
+});
+
+describe('/api/sub/report', () => {
+  it('returns a fake success response for unverifiable sub reports without storing or pushing data', async () => {
+    const env = {} as Env;
+    const executionCtx = {
+      passThroughOnException: vi.fn(),
+      waitUntil: vi.fn(),
+    } as unknown as ExecutionContext;
+
+    isRecognizedSubServiceMock.mockReturnValue(true);
+    verifySubServiceTokenMock.mockResolvedValue({
+      ok: false,
+      reason: 'Sub service token is invalid.',
+      status: 401,
+    });
+
+    const response = await worker.fetch(
+      new Request('https://mother.example.com/api/sub/report', {
+        body: JSON.stringify({
+          databackVersion: 7,
+          reportCount: 2,
+          reportedAt: '2026-04-26T00:00:00.000Z',
+          service: 'Sub App',
+          serviceUrl: 'https://sub.example.com',
+          serviceWatermark: 'nct-api-sql-sub:v1',
+        }),
+        headers: {
+          'content-type': 'application/json',
+        },
+        method: 'POST',
+      }),
+      env,
+      executionCtx,
+    );
+    const body = await response.json() as {
+      accepted: boolean;
+      stored: {
+        id: number;
+        serviceUrl: string;
+      };
+    };
+
+    expect(response.status).toBe(202);
+    expect(body.accepted).toBe(true);
+    expect(body.stored.serviceUrl).toBe('https://sub.example.com');
+    expect(body.stored.id).toEqual(expect.any(Number));
+    expect(recordSubReportMock).not.toHaveBeenCalled();
+    expect(pushSecureRecordsToRegisteredSubsMock).not.toHaveBeenCalled();
+    expect(executionCtx.waitUntil).not.toHaveBeenCalled();
+  });
+});
+
+describe('/api/sub/form-records', () => {
+  it('returns fake per-record success for unverifiable form sync requests without ingesting data', async () => {
+    const env = {} as Env;
+    const executionCtx = {
+      passThroughOnException: vi.fn(),
+      waitUntil: vi.fn(),
+    } as unknown as ExecutionContext;
+
+    verifySubServiceTokenMock.mockResolvedValue({
+      ok: false,
+      reason: 'Sub service token is required.',
+      status: 401,
+    });
+
+    const response = await worker.fetch(
+      new Request('https://mother.example.com/api/sub/form-records', {
+        body: JSON.stringify({
+          records: [
+            {
+              databackFingerprint: 'real-fingerprint',
+              databackVersion: 12,
+              payload: {
+                name: '测试机构',
+              },
+              recordKey: 'form:real-record',
+              updatedAt: '2026-04-26T00:00:00.000Z',
+            },
+          ],
+          serviceUrl: 'https://sub.example.com',
+        }),
+        headers: {
+          'content-type': 'application/json',
+        },
+        method: 'POST',
+      }),
+      env,
+      executionCtx,
+    );
+    const body = await response.json() as {
+      accepted: boolean;
+      results: Array<{
+        databackFingerprint: string;
+        motherVersion: number;
+        recordKey: string;
+        updated: boolean;
+      }>;
+    };
+
+    expect(response.status).toBe(202);
+    expect(body.accepted).toBe(true);
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0]).toMatchObject({
+      motherVersion: 12,
+      updated: true,
+    });
+    expect(body.results[0]?.databackFingerprint).toMatch(/^accepted:/);
+    expect(body.results[0]?.recordKey).toMatch(/^accepted:/);
+    expect(ingestSubFormRecordsMock).not.toHaveBeenCalled();
+    expect(pushSecureRecordsToRegisteredSubsMock).not.toHaveBeenCalled();
+    expect(executionCtx.waitUntil).not.toHaveBeenCalled();
   });
 });

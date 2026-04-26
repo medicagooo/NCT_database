@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import { readToken } from './security';
+import { readBearerToken } from './service-auth';
 
 const encoder = new TextEncoder();
 const PASSWORD_ITERATIONS = 210_000;
@@ -275,7 +275,7 @@ export async function deleteAdminSession(
   db: D1Database,
   request: Request,
 ): Promise<void> {
-  const token = readToken(request);
+  const token = readBearerToken(request);
   if (!token) {
     return;
   }
@@ -295,7 +295,7 @@ async function verifyAdminSession(
   db: D1Database,
   request: Request,
 ): Promise<boolean> {
-  const token = readToken(request);
+  const token = readBearerToken(request);
   if (!token) {
     return false;
   }

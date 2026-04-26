@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
-import { sha256 } from './crypto';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { hmacSha256, sha256 } from './crypto';
 import { verifySubServiceToken } from './data';
+
+const SUB_AUTH_TOKEN_ALGORITHM = 'NCT-MOTHER-AUTH-HMAC-SHA256-T30-V1';
+const SUB_AUTH_TOKEN_STEP_MS = 30 * 1000;
 
 type DownstreamClientRow = {
   id: number;
@@ -27,7 +30,6 @@ type DownstreamClientRow = {
   auth_failure_count: number | null;
   blacklisted_at: string | null;
   auth_token_hash: string | null;
-  sub_service_encryption_public_key: string | null;
   auth_issued_at: string | null;
   auth_last_success_at: string | null;
   auth_last_failure_at: string | null;
@@ -45,7 +47,7 @@ function createClientRow(
     last_sync_version: 0,
     last_seen_at: '2026-04-24T00:00:00.000Z',
     last_push_at: null,
-    last_status: 'bootstrapped',
+    last_status: 'reported',
     last_response_code: 202,
     last_error: null,
     service_url: 'https://sub.example.com',
@@ -61,7 +63,6 @@ function createClientRow(
     auth_failure_count: 0,
     blacklisted_at: null,
     auth_token_hash: null,
-    sub_service_encryption_public_key: null,
     auth_issued_at: '2026-04-24T00:00:00.000Z',
     auth_last_success_at: null,
     auth_last_failure_at: null,
@@ -82,8 +83,9 @@ function createAuthDb(row: DownstreamClientRow) {
         bind(...params: unknown[]) {
           return {
             first: async () => {
-              if (sql.includes('WHERE auth_token_hash = ?')) {
-                return state.row.auth_token_hash === params[0]
+              if (sql.includes('WHERE service_url = ?')) {
+                return state.row.service_url === params[0]
+                  || state.row.callback_url === params[1]
                   ? { ...state.row }
                   : null;
               }
@@ -133,19 +135,42 @@ function createAuthDb(row: DownstreamClientRow) {
   };
 }
 
+async function createRotatingToken(
+  serviceUrl: string,
+  nowMs = Date.now(),
+): Promise<string> {
+  return hmacSha256(
+    [
+      SUB_AUTH_TOKEN_ALGORITHM,
+      serviceUrl,
+      String(Math.floor(nowMs / SUB_AUTH_TOKEN_STEP_MS)),
+    ].join('\n'),
+    serviceUrl,
+  );
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe('verifySubServiceToken', () => {
-  it('authenticates the sub identity from the token binding instead of the claimed URL alone', async () => {
-    const token = 'bound-token';
+  it('authenticates the sub identity from a 30-second rotating token', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-26T00:00:10.000Z'));
+    const serviceUrl = 'https://sub.example.com';
+    const token = await createRotatingToken(serviceUrl);
     const { db, state } = createAuthDb(
       createClientRow({
         auth_failure_count: 2,
-        auth_token_hash: await sha256(token),
+        auth_token_hash: await sha256(serviceUrl),
       }),
     );
 
     const result = await verifySubServiceToken(
-      db,
-      'https://sub.example.com',
+      {
+        DB: db,
+      } as Env,
+      serviceUrl,
       token,
       5,
     );
@@ -154,22 +179,62 @@ describe('verifySubServiceToken', () => {
     if (!result.ok) {
       return;
     }
+    expect(result.stored).not.toBeNull();
+    if (!result.stored) {
+      return;
+    }
     expect(result.stored.serviceUrl).toBe('https://sub.example.com');
     expect(state.row.auth_failure_count).toBe(0);
     expect(state.row.auth_last_success_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(state.row.last_error).toBeNull();
   });
 
-  it('rejects requests whose claimed service URL does not match the token-bound identity', async () => {
-    const token = 'bound-token';
-    const { db, state } = createAuthDb(
+  it('allows first report authentication before the sub row exists', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-26T00:00:10.000Z'));
+    const serviceUrl = 'https://new-sub.example.com';
+    const token = await createRotatingToken(serviceUrl);
+    const { db } = createAuthDb(
       createClientRow({
-        auth_token_hash: await sha256(token),
+        callback_url: 'sub-report:https://other.example.com',
+        service_url: 'https://other.example.com',
       }),
     );
 
     const result = await verifySubServiceToken(
-      db,
+      {
+        DB: db,
+      } as Env,
+      serviceUrl,
+      token,
+      5,
+      {
+        allowUnregistered: true,
+      },
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      stored: null,
+    });
+  });
+
+  it('rejects rotating tokens derived for a different service URL', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-26T00:00:10.000Z'));
+    const token = await createRotatingToken('https://sub.example.com');
+    const { db, state } = createAuthDb(
+      createClientRow({
+        auth_token_hash: await sha256('https://spoofed.example.com'),
+        callback_url: 'sub-report:https://spoofed.example.com',
+        service_url: 'https://spoofed.example.com',
+      }),
+    );
+
+    const result = await verifySubServiceToken(
+      {
+        DB: db,
+      } as Env,
       'https://spoofed.example.com',
       token,
       3,
@@ -177,23 +242,25 @@ describe('verifySubServiceToken', () => {
 
     expect(result).toEqual({
       ok: false,
-      reason: 'Sub service identity does not match the claimed service URL.',
-      status: 403,
+      reason: 'Sub service token is invalid.',
+      status: 401,
     });
-    expect(state.row.auth_failure_count).toBe(1);
-    expect(state.row.last_response_code).toBe(403);
+    expect(state.row.auth_failure_count).toBe(0);
+    expect(state.row.last_response_code).toBe(202);
     expect(state.row.blacklisted_at).toBeNull();
   });
 
   it('does not blacklist a registered sub when an unrelated invalid token spoofs its URL', async () => {
     const { db, state } = createAuthDb(
       createClientRow({
-        auth_token_hash: await sha256('real-bound-token'),
+        auth_token_hash: await sha256('https://sub.example.com'),
       }),
     );
 
     const result = await verifySubServiceToken(
-      db,
+      {
+        DB: db,
+      } as Env,
       'https://sub.example.com',
       'invalid-token',
       1,

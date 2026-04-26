@@ -1,16 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { encryptObjectMock, sha256Mock } = vi.hoisted(() => ({
+const { encryptObjectMock, hmacSha256Mock, sha256Mock } = vi.hoisted(() => ({
   encryptObjectMock: vi.fn(),
+  hmacSha256Mock: vi.fn(),
   sha256Mock: vi.fn(),
 }));
 
 vi.mock('./crypto', () => ({
-  decryptJsonWithPrivateKey: vi.fn(),
   decryptObject: vi.fn(),
-  deriveEncryptionPublicKeyFromPrivateKey: vi.fn(),
-  encryptJsonWithPublicKey: vi.fn(),
   encryptObject: encryptObjectMock,
+  hmacSha256: hmacSha256Mock,
   sha256: sha256Mock,
 }));
 
@@ -101,7 +100,7 @@ function createDownstreamClientRow(
     last_sync_version: 0,
     last_seen_at: '2026-04-24T00:00:00.000Z',
     last_push_at: null,
-    last_status: 'bootstrapped',
+    last_status: 'reported',
     last_response_code: 202,
     last_error: null,
     service_url: 'https://sub.example.com',
@@ -117,7 +116,6 @@ function createDownstreamClientRow(
     auth_failure_count: 0,
     blacklisted_at: null,
     auth_token_hash: null,
-    sub_service_encryption_public_key: null,
     auth_issued_at: '2026-04-24T00:00:00.000Z',
     auth_last_success_at: null,
     auth_last_failure_at: null,
@@ -506,6 +504,7 @@ describe('ingestSubFormRecords', () => {
   });
 
   it('keeps raw updates, encrypted secure records, versions, and sub pushes in sync', async () => {
+    hmacSha256Mock.mockResolvedValue('rotating-auth-token');
     sha256Mock.mockImplementation(async (value: string) => {
       if (value.includes('13900000000')) {
         return '000002'.padEnd(64, '0');
@@ -650,6 +649,10 @@ describe('ingestSubFormRecords', () => {
     const [pushUrl, requestInit] = fetchMock.mock.calls[0]!;
     expect(pushUrl).toBe('https://sub.example.com/api/push/secure-records');
     expect(requestInit?.method).toBe('POST');
+    expect(requestInit?.headers).toMatchObject({
+      authorization: 'Bearer rotating-auth-token',
+      'content-type': 'application/json',
+    });
     const pushedBody = JSON.parse(String(requestInit?.body));
     expect(pushedBody).toMatchObject({
       currentVersion: 5,

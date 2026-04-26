@@ -9,10 +9,8 @@ import type {
   PublicDatasetItem,
   PublicDatasetResponse,
   RawRecord,
-  RsaOaepEncryptedEnvelope,
   SecureRecord,
   SecureTransferPayload,
-  SubBootstrapPayload,
   SubDatabackExportFile,
   SubFormRecordResult,
   SubFormRecordsRequest,
@@ -23,10 +21,7 @@ import type {
   SyncRequest,
 } from '../../shared/types';
 import {
-  decryptJsonWithPrivateKey,
   decryptObject,
-  deriveEncryptionPublicKeyFromPrivateKey,
-  encryptJsonWithPublicKey,
   encryptObject,
   sha256,
 } from './crypto';
@@ -46,9 +41,9 @@ import {
   deriveRecordContentVersion,
 } from './record-version';
 import {
-  buildServiceAuthHeaders,
-  deriveSigningPublicKeyFromPrivateKey,
-} from './security';
+  deriveServiceAuthToken,
+  verifyServiceAuthToken,
+} from './service-auth';
 
 type RawRecordRow = Record<string, unknown> & {
   id: string;
@@ -103,7 +98,6 @@ type DownstreamClientRow = {
   auth_failure_count: number | null;
   blacklisted_at: string | null;
   auth_token_hash: string | null;
-  sub_service_encryption_public_key: string | null;
   auth_issued_at: string | null;
   auth_last_success_at: string | null;
   auth_last_failure_at: string | null;
@@ -543,22 +537,6 @@ async function readDownstreamClientRowById(
     .first<DownstreamClientRow>();
 }
 
-async function readDownstreamClientRowByAuthTokenHash(
-  db: D1Database,
-  authTokenHash: string,
-): Promise<DownstreamClientRow | null> {
-  return db.prepare(
-    `
-      SELECT *
-      FROM downstream_clients
-      WHERE auth_token_hash = ?
-      LIMIT 1
-    `,
-  )
-    .bind(authTokenHash)
-    .first<DownstreamClientRow>();
-}
-
 async function readDownstreamClientByServiceUrl(
   db: D1Database,
   serviceUrl: string,
@@ -573,111 +551,6 @@ async function readDownstreamClientById(
 ): Promise<DownstreamClient | null> {
   const row = await readDownstreamClientRowById(db, id);
   return row ? mapDownstreamClient(row) : null;
-}
-
-export async function bootstrapSubServiceAuth(
-  env: Env,
-  payload: SubBootstrapPayload,
-): Promise<{
-  encryptedAuthToken: RsaOaepEncryptedEnvelope;
-  motherServiceEncryptionPublicKey: string | null;
-  motherServicePublicKey: string | null;
-  stored: DownstreamClient;
-}> {
-  if (!isRecognizedSubService(payload.service, payload.serviceWatermark)) {
-    throw new Error('Only nct-api-sql-sub bootstrap requests are accepted.');
-  }
-
-  const serviceUrl = payload.serviceUrl.trim();
-  const existing = await readDownstreamClientRowByServiceUrl(env.DB, serviceUrl);
-  if (existing?.blacklisted_at) {
-    throw new Error('This sub service has been blacklisted.');
-  }
-
-  const motherServicePublicKey = env.SERVICE_SIGNING_PRIVATE_KEY
-    ? await deriveSigningPublicKeyFromPrivateKey(env.SERVICE_SIGNING_PRIVATE_KEY)
-    : null;
-  const motherServiceEncryptionPublicKey = env.SERVICE_ENCRYPTION_PRIVATE_KEY
-    ? await deriveEncryptionPublicKeyFromPrivateKey(env.SERVICE_ENCRYPTION_PRIVATE_KEY)
-    : null;
-
-  if (!motherServiceEncryptionPublicKey) {
-    throw new Error('SERVICE_ENCRYPTION_PRIVATE_KEY is required for sub bootstrap.');
-  }
-
-  const authToken = `${crypto.randomUUID()}.${crypto.randomUUID()}`;
-  const authTokenHash = await sha256(authToken);
-  const receivedAt = nowIso();
-  const storageKey = buildSubReportKey(serviceUrl);
-  const encryptedAuthToken = await encryptJsonWithPublicKey(
-    {
-      issuedAt: receivedAt,
-      serviceUrl,
-      token: authToken,
-    },
-    payload.subServiceEncryptionPublicKey,
-  );
-
-  await env.DB.prepare(
-    `
-      INSERT INTO downstream_clients (
-        entry_kind,
-        client_name,
-        callback_url,
-        client_version,
-        last_sync_version,
-        last_seen_at,
-        last_status,
-        last_response_code,
-        last_error,
-        service_url,
-        auth_token_hash,
-        sub_service_encryption_public_key,
-        auth_issued_at,
-        auth_failure_count,
-        blacklisted_at
-      )
-      VALUES (
-        'sub-report',
-        ?, ?, 0, 0, ?, 'bootstrapped', 202, NULL, ?, ?, ?, ?, 0, NULL
-      )
-      ON CONFLICT(callback_url) DO UPDATE SET
-        entry_kind = 'sub-report',
-        client_name = excluded.client_name,
-        last_seen_at = excluded.last_seen_at,
-        last_status = excluded.last_status,
-        last_response_code = excluded.last_response_code,
-        last_error = NULL,
-        service_url = excluded.service_url,
-        auth_token_hash = excluded.auth_token_hash,
-        sub_service_encryption_public_key = excluded.sub_service_encryption_public_key,
-        auth_issued_at = excluded.auth_issued_at,
-        auth_failure_count = 0,
-        blacklisted_at = NULL
-    `,
-  )
-    .bind(
-      payload.service,
-      storageKey,
-      receivedAt,
-      serviceUrl,
-      authTokenHash,
-      payload.subServiceEncryptionPublicKey,
-      receivedAt,
-    )
-    .run();
-
-  const stored = await readDownstreamClientByServiceUrl(env.DB, serviceUrl);
-  if (!stored) {
-    throw new Error('Failed to persist sub bootstrap state.');
-  }
-
-  return {
-    encryptedAuthToken,
-    motherServiceEncryptionPublicKey,
-    motherServicePublicKey,
-    stored,
-  };
 }
 
 async function recordSubAuthFailure(
@@ -721,13 +594,34 @@ async function recordSubAuthFailure(
   };
 }
 
+async function verifyRotatingSubAuthToken(
+  row: DownstreamClientRow,
+  serviceUrl: string,
+  token: string,
+): Promise<boolean> {
+  const credentialSeed = serviceUrl.trim();
+  if (!credentialSeed) {
+    return false;
+  }
+
+  const expectedHash = await sha256(credentialSeed);
+  if (row.auth_token_hash?.trim() !== expectedHash) {
+    return false;
+  }
+
+  return verifyServiceAuthToken(serviceUrl, token);
+}
+
 export async function verifySubServiceToken(
-  db: D1Database,
+  env: Env,
   claimedServiceUrl: string,
   token: string | null,
   maxFailures: number,
+  options: {
+    allowUnregistered?: boolean;
+  } = {},
 ): Promise<
-  | { ok: true; stored: DownstreamClient }
+  | { ok: true; stored: DownstreamClient | null }
   | { ok: false; reason: string; status: 401 | 403 }
 > {
   if (!token?.trim()) {
@@ -738,12 +632,33 @@ export async function verifySubServiceToken(
     };
   }
 
-  const tokenHash = await sha256(token.trim());
-  const row = await readDownstreamClientRowByAuthTokenHash(db, tokenHash);
-  if (!row) {
+  const normalizedClaimedServiceUrl = claimedServiceUrl.trim();
+  if (!normalizedClaimedServiceUrl) {
     return {
       ok: false,
-      reason: 'Sub service token is invalid.',
+      reason: 'Sub service URL is required.',
+      status: 401,
+    };
+  }
+
+  const row = await readDownstreamClientRowByServiceUrl(env.DB, normalizedClaimedServiceUrl);
+  if (!row) {
+    if (
+      options.allowUnregistered
+      && await verifyServiceAuthToken(
+        normalizedClaimedServiceUrl,
+        token.trim(),
+      )
+    ) {
+      return {
+        ok: true,
+        stored: null,
+      };
+    }
+
+    return {
+      ok: false,
+      reason: 'Sub service is not registered.',
       status: 401,
     };
   }
@@ -756,7 +671,6 @@ export async function verifySubServiceToken(
     };
   }
 
-  const normalizedClaimedServiceUrl = claimedServiceUrl.trim();
   const normalizedStoredServiceUrl = row.service_url?.trim() || '';
   if (
     normalizedClaimedServiceUrl
@@ -764,7 +678,7 @@ export async function verifySubServiceToken(
     && normalizedClaimedServiceUrl !== normalizedStoredServiceUrl
   ) {
     const failure = await recordSubAuthFailure(
-      db,
+      env.DB,
       row,
       maxFailures,
       'Sub service identity does not match the claimed service URL.',
@@ -779,8 +693,17 @@ export async function verifySubServiceToken(
     };
   }
 
+  const verifiedServiceUrl = normalizedStoredServiceUrl || normalizedClaimedServiceUrl;
+  if (!(await verifyRotatingSubAuthToken(row, verifiedServiceUrl, token.trim()))) {
+    return {
+      ok: false,
+      reason: 'Sub service token is invalid.',
+      status: 401,
+    };
+  }
+
   const authenticatedAt = nowIso();
-  await db.prepare(
+  await env.DB.prepare(
     `
       UPDATE downstream_clients
       SET auth_failure_count = 0,
@@ -797,7 +720,7 @@ export async function verifySubServiceToken(
     )
     .run();
 
-  const stored = await readDownstreamClientById(db, row.id);
+  const stored = await readDownstreamClientById(env.DB, row.id);
   if (!stored) {
     throw new Error('Failed to read back sub auth state.');
   }
@@ -1331,15 +1254,19 @@ function isSecureTransferPayload(
   }
 
   const candidate = value as Record<string, unknown>;
+  const encryptedData = candidate.encryptedData as Record<string, unknown> | undefined;
   return (
     typeof candidate.keyVersion === 'number'
     && Number.isFinite(candidate.keyVersion)
     && !!candidate.publicData
     && typeof candidate.publicData === 'object'
     && !Array.isArray(candidate.publicData)
-    && !!candidate.encryptedData
-    && typeof candidate.encryptedData === 'object'
-    && !Array.isArray(candidate.encryptedData)
+    && !!encryptedData
+    && typeof encryptedData === 'object'
+    && !Array.isArray(encryptedData)
+    && encryptedData.algorithm === 'AES-GCM'
+    && typeof encryptedData.iv === 'string'
+    && typeof encryptedData.ciphertext === 'string'
     && Array.isArray(candidate.encryptFields)
     && candidate.encryptFields.every((field) => typeof field === 'string')
     && (typeof candidate.syncedAt === 'string' || candidate.syncedAt === null)
@@ -1348,22 +1275,6 @@ function isSecureTransferPayload(
 
 function isPlainJsonObject(value: unknown): value is JsonObject {
   return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isRsaOaepEncryptedEnvelope(
-  value: unknown,
-): value is RsaOaepEncryptedEnvelope {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-
-  const candidate = value as Record<string, unknown>;
-  return (
-    candidate.algorithm === 'RSA-OAEP-SHA-256+A256GCM'
-    && typeof candidate.encryptedKey === 'string'
-    && typeof candidate.iv === 'string'
-    && typeof candidate.ciphertext === 'string'
-  );
 }
 
 function parseSubDatabackExportFile(
@@ -1382,7 +1293,6 @@ function parseSubDatabackExportFile(
       && typeof candidate.currentVersion !== 'number')
     || typeof candidate.exportedAt !== 'string'
     || typeof candidate.totalRecords !== 'number'
-    || !isRsaOaepEncryptedEnvelope(candidate.encryptedRecords)
     || !Array.isArray(candidate.records)
   ) {
     throw new Error('Sub export file is missing required fields.');
@@ -1400,6 +1310,10 @@ function parseSubDatabackExportFile(
       || typeof entry.fingerprint !== 'string'
       || typeof entry.updatedAt !== 'string'
       || (
+        !isSecureTransferPayload(entry.payload)
+        && !isPlainJsonObject(entry.payload)
+      )
+      || (
         entry.payloadEncryptionState !== 'plain-json'
         && entry.payloadEncryptionState !== 'secure-transfer'
       )
@@ -1408,6 +1322,7 @@ function parseSubDatabackExportFile(
     }
 
     return {
+      payload: entry.payload,
       payloadEncryptionState: entry.payloadEncryptionState as SubDatabackExportFile['records'][number]['payloadEncryptionState'],
       recordKey: entry.recordKey,
       version: entry.version,
@@ -1423,54 +1338,8 @@ function parseSubDatabackExportFile(
     currentVersion: candidate.currentVersion,
     exportedAt: candidate.exportedAt,
     totalRecords: candidate.totalRecords,
-    encryptedRecords: candidate.encryptedRecords,
     records,
   };
-}
-
-type DecryptedSubDatabackExportRecord = SubDatabackExportFile['records'][number] & {
-  payload: SecureTransferPayload | JsonObject;
-};
-
-function parseDecryptedSubDatabackExportRecords(
-  value: unknown,
-): DecryptedSubDatabackExportRecord[] {
-  if (!Array.isArray(value)) {
-    throw new Error('Decrypted sub export payload is not a record array.');
-  }
-
-  return value.map((record) => {
-    if (!record || typeof record !== 'object' || Array.isArray(record)) {
-      throw new Error('Decrypted sub export record must be a JSON object.');
-    }
-
-    const entry = record as Record<string, unknown>;
-    if (
-      typeof entry.recordKey !== 'string'
-      || typeof entry.version !== 'number'
-      || typeof entry.fingerprint !== 'string'
-      || typeof entry.updatedAt !== 'string'
-      || (
-        entry.payloadEncryptionState !== 'plain-json'
-        && entry.payloadEncryptionState !== 'secure-transfer'
-      )
-      || (
-        !isSecureTransferPayload(entry.payload)
-        && !isPlainJsonObject(entry.payload)
-      )
-    ) {
-      throw new Error('Decrypted sub export record has an invalid shape.');
-    }
-
-    return {
-      payload: entry.payload,
-      payloadEncryptionState: entry.payloadEncryptionState,
-      recordKey: entry.recordKey,
-      version: entry.version,
-      fingerprint: entry.fingerprint,
-      updatedAt: entry.updatedAt,
-    };
-  });
 }
 
 async function computeSecureTransferFingerprint(
@@ -1620,7 +1489,7 @@ async function upsertRawRecord(
 async function upsertRecoveredSecureTransferRecord(
   env: Env,
   serviceUrl: string,
-  record: DecryptedSubDatabackExportRecord,
+  record: SubDatabackExportFile['records'][number],
 ): Promise<boolean> {
   if (!isSecureTransferPayload(record.payload)) {
     throw new Error('Recovered secure transfer payload is invalid.');
@@ -1810,32 +1679,17 @@ async function importSubDatabackExportFile(
   skippedCount: number;
   highestPulledVersion: number;
 }> {
+  if (exportFile.serviceUrl.trim() !== serviceUrl) {
+    throw new Error(
+      `Sub export service URL mismatch: expected ${serviceUrl}, got ${exportFile.serviceUrl.trim()}.`,
+    );
+  }
+
   let updatedCount = 0;
   let skippedCount = 0;
   let highestPulledVersion = Math.max(0, exportFile.afterVersion);
-  const encryptionPrivateKey = env.SERVICE_ENCRYPTION_PRIVATE_KEY?.trim();
-  if (!encryptionPrivateKey) {
-    throw new Error('SERVICE_ENCRYPTION_PRIVATE_KEY is required for recovery pull import.');
-  }
 
-  const decryptedRecords = parseDecryptedSubDatabackExportRecords(
-    await decryptJsonWithPrivateKey(exportFile.encryptedRecords, encryptionPrivateKey),
-  );
-  if (decryptedRecords.length !== exportFile.records.length) {
-    throw new Error('Decrypted sub export payload count does not match the file manifest.');
-  }
-
-  for (const [index, record] of exportFile.records.entries()) {
-    const decryptedRecord = decryptedRecords[index];
-    if (
-      decryptedRecord.recordKey !== record.recordKey
-      || decryptedRecord.version !== record.version
-      || decryptedRecord.fingerprint !== record.fingerprint
-      || decryptedRecord.payloadEncryptionState !== record.payloadEncryptionState
-    ) {
-      throw new Error('Decrypted sub export payload does not match the file manifest.');
-    }
-
+  for (const record of exportFile.records) {
     highestPulledVersion = Math.max(
       highestPulledVersion,
       Math.max(0, Number(record.version)),
@@ -1862,7 +1716,7 @@ async function importSubDatabackExportFile(
       const updated = await upsertRecoveredSecureTransferRecord(
         env,
         serviceUrl,
-        decryptedRecord,
+        record,
       );
       if (updated) {
         updatedCount += 1;
@@ -1872,7 +1726,7 @@ async function importSubDatabackExportFile(
       continue;
     }
 
-    const payload = toJsonObject(decryptedRecord.payload);
+    const payload = toJsonObject(record.payload);
     const fingerprint = await computeRecordContentFingerprint(payload);
     if (fingerprint !== record.fingerprint) {
       throw new Error(
@@ -2082,6 +1936,7 @@ export async function recordSubReport(
 ): Promise<DownstreamClient> {
   const receivedAt = nowIso();
   const storageKey = buildSubReportKey(report.serviceUrl);
+  const authTokenHash = await sha256(report.serviceUrl.trim());
   const persistedPayload: JsonObject = {
     service: report.service,
     serviceWatermark: report.serviceWatermark,
@@ -2109,21 +1964,34 @@ export async function recordSubReport(
         databack_version,
         report_count,
         reported_at,
+        auth_token_hash,
+        auth_issued_at,
+        auth_last_success_at,
+        auth_failure_count,
+        blacklisted_at,
         payload_json
       )
       VALUES (
         'sub-report',
-        ?, ?, ?, 0, ?, NULL, 'reported', 202, NULL, ?, ?, ?, ?, ?
+        ?, ?, ?, 0, ?, NULL, 'reported', 202, NULL, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?
       )
       ON CONFLICT(callback_url) DO UPDATE SET
         entry_kind = 'sub-report',
         client_name = excluded.client_name,
         client_version = excluded.client_version,
         last_seen_at = excluded.last_seen_at,
+        last_status = 'reported',
+        last_response_code = 202,
+        last_error = NULL,
         service_url = excluded.service_url,
         databack_version = excluded.databack_version,
         report_count = excluded.report_count,
         reported_at = excluded.reported_at,
+        auth_token_hash = excluded.auth_token_hash,
+        auth_issued_at = COALESCE(downstream_clients.auth_issued_at, excluded.auth_issued_at),
+        auth_last_success_at = excluded.auth_last_success_at,
+        auth_failure_count = 0,
+        blacklisted_at = NULL,
         payload_json = excluded.payload_json
     `,
   )
@@ -2136,6 +2004,9 @@ export async function recordSubReport(
       report.databackVersion,
       report.reportCount,
       report.reportedAt,
+      authTokenHash,
+      receivedAt,
+      receivedAt,
       payloadJson,
     )
     .run();
@@ -2246,12 +2117,8 @@ export async function pushSecureRecordsToRegisteredSubs(
       const response = await fetch(pushUrl, {
         method: 'POST',
         headers: {
+          authorization: `Bearer ${await deriveServiceAuthToken(serviceUrl)}`,
           'content-type': 'application/json',
-          ...await buildServiceAuthHeaders(env, {
-            body,
-            method: 'POST',
-            url: pushUrl,
-          }),
         },
         body,
       });
@@ -2354,6 +2221,117 @@ export async function pushSecureRecordsToRegisteredSubs(
   }
 
   return results;
+}
+
+function getSubPullMaxAttempts(env: Env): number {
+  return Math.max(
+    1,
+    Math.min(Number(env.SUB_PULL_MAX_ATTEMPTS ?? '5'), 10),
+  );
+}
+
+function getSubPullRetryDelayMs(env: Env): number {
+  return Math.max(
+    0,
+    Number(env.SUB_PULL_RETRY_DELAY_MS ?? '60000'),
+  );
+}
+
+function readRetryAfterMs(response: Response): number | null {
+  const retryAfter = response.headers.get('retry-after')?.trim();
+  if (!retryAfter) {
+    return null;
+  }
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+
+  const dateMs = Date.parse(retryAfter);
+  return Number.isFinite(dateMs)
+    ? Math.max(0, dateMs - Date.now())
+    : null;
+}
+
+async function waitMs(delayMs: number): Promise<void> {
+  if (delayMs <= 0) {
+    return;
+  }
+
+  await new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
+async function fetchSubDatabackExportWithRetry(
+  env: Env,
+  input: {
+    serviceUrl: string;
+    timeoutMs: number;
+    url: string;
+  },
+): Promise<{
+  bodyText: string;
+  responseCode: number;
+}> {
+  const maxAttempts = getSubPullMaxAttempts(env);
+  const defaultRetryDelayMs = getSubPullRetryDelayMs(env);
+  let lastReason = 'Unknown pull failure';
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
+
+    try {
+      const response = await fetch(input.url, {
+        method: 'GET',
+        headers: {
+          authorization: `Bearer ${await deriveServiceAuthToken(input.serviceUrl)}`,
+        },
+        signal: controller.signal,
+      });
+      const bodyText = await response.text();
+
+      if (response.ok) {
+        return {
+          bodyText,
+          responseCode: response.status,
+        };
+      }
+
+      lastReason = bodyText || `Pull failed with status ${response.status}.`;
+      if (attempt >= maxAttempts) {
+        return {
+          bodyText: lastReason,
+          responseCode: response.status,
+        };
+      }
+
+      console.warn(
+        `Databack pull attempt ${attempt}/${maxAttempts} failed for ${input.serviceUrl}: ${lastReason}`,
+      );
+      await waitMs(readRetryAfterMs(response) ?? defaultRetryDelayMs);
+    } catch (error) {
+      lastReason = error instanceof Error ? error.message : 'Unknown pull error';
+      if (attempt >= maxAttempts) {
+        throw new Error(
+          `Databack pull failed after ${maxAttempts} attempts for ${input.serviceUrl}: ${lastReason}`,
+        );
+      }
+
+      console.warn(
+        `Databack pull attempt ${attempt}/${maxAttempts} errored for ${input.serviceUrl}: ${lastReason}`,
+      );
+      await waitMs(defaultRetryDelayMs);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error(
+    `Databack pull failed after ${maxAttempts} attempts for ${input.serviceUrl}: ${lastReason}`,
+  );
 }
 
 export async function pullDatabackFromRegisteredSubs(
@@ -2469,8 +2447,14 @@ export async function pullDatabackFromRegisteredSubs(
 
     try {
       let hasMore = true;
+      let requestCount = 0;
 
       while (hasMore) {
+        if (requestCount > 0) {
+          await waitMs(getSubPullRetryDelayMs(env));
+        }
+        requestCount += 1;
+
         const requestUrl = new URL(exportUrl);
         requestUrl.searchParams.set(
           'afterVersion',
@@ -2480,82 +2464,75 @@ export async function pullDatabackFromRegisteredSubs(
           'limit',
           String(recordLimit),
         );
+        const pullResponse = await fetchSubDatabackExportWithRetry(env, {
+          serviceUrl,
+          timeoutMs,
+          url: requestUrl.toString(),
+        });
+        responseCode = pullResponse.responseCode;
 
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-        try {
-          const response = await fetch(requestUrl.toString(), {
-            method: 'GET',
-            headers: await buildServiceAuthHeaders(env, {
-              method: 'GET',
-              url: requestUrl.toString(),
-            }),
-            signal: controller.signal,
-          });
-          responseCode = response.status;
-
-          if (!response.ok) {
-            const reason = await response.text();
-            await env.DB.prepare(
-              `
-                UPDATE downstream_clients
-                SET last_pull_status = 'pull-failed',
-                    last_pull_response_code = ?,
-                    last_pull_error = ?
-                WHERE id = ?
-              `,
+        if (responseCode < 200 || responseCode >= 300) {
+          const reason = pullResponse.bodyText
+            || `Pull failed with status ${responseCode}.`;
+          console.error(
+            `Databack pull failed after ${getSubPullMaxAttempts(env)} attempts for ${serviceUrl}: ${reason}`,
+          );
+          await env.DB.prepare(
+            `
+              UPDATE downstream_clients
+              SET last_pull_status = 'pull-failed',
+                  last_pull_response_code = ?,
+                  last_pull_error = ?
+              WHERE id = ?
+            `,
+          )
+            .bind(
+              responseCode,
+              reason,
+              row.id,
             )
-              .bind(
-                response.status,
-                reason || `Pull failed with status ${response.status}.`,
-                row.id,
-              )
-              .run();
+            .run();
 
-            results.push({
-              serviceUrl,
-              exportUrl,
-              previousVersion,
-              reportedVersion,
-              pulled: false,
-              status: 'pull-failed',
-              responseCode: response.status,
-              receivedCount,
-              updatedCount,
-              skippedCount,
-              highestPulledVersion,
-              lastPullAt: row.last_pull_at,
-              reason: reason || `Pull failed with status ${response.status}.`,
-            });
-            failed = true;
-            hasMore = false;
-            break;
-          }
-
-          const exportFile = parseSubDatabackExportFile(
-            JSON.parse(await response.text()),
-          );
-          const importResult = await importSubDatabackExportFile(
-            env,
+          results.push({
             serviceUrl,
-            exportFile,
-          );
-
-          receivedCount += importResult.receivedCount;
-          updatedCount += importResult.updatedCount;
-          skippedCount += importResult.skippedCount;
-          highestPulledVersion = Math.max(
+            exportUrl,
+            previousVersion,
+            reportedVersion,
+            pulled: false,
+            status: 'pull-failed',
+            responseCode,
+            receivedCount,
+            updatedCount,
+            skippedCount,
             highestPulledVersion,
-            importResult.highestPulledVersion,
-            Number(exportFile.currentVersion ?? 0),
-          );
-          hasMore =
-            exportFile.records.length >= recordLimit
-            && highestPulledVersion < Number(exportFile.currentVersion ?? 0);
-        } finally {
-          clearTimeout(timeout);
+            lastPullAt: row.last_pull_at,
+            reason,
+          });
+          failed = true;
+          hasMore = false;
+          break;
         }
+
+        const exportFile = parseSubDatabackExportFile(
+          JSON.parse(pullResponse.bodyText),
+        );
+        const importResult = await importSubDatabackExportFile(
+          env,
+          serviceUrl,
+          exportFile,
+        );
+
+        receivedCount += importResult.receivedCount;
+        updatedCount += importResult.updatedCount;
+        skippedCount += importResult.skippedCount;
+        highestPulledVersion = Math.max(
+          highestPulledVersion,
+          importResult.highestPulledVersion,
+          Number(exportFile.currentVersion ?? 0),
+        );
+        hasMore =
+          exportFile.records.length >= recordLimit
+          && highestPulledVersion < Number(exportFile.currentVersion ?? 0);
       }
 
       if (failed || responseCode === null) {
@@ -2608,6 +2585,9 @@ export async function pullDatabackFromRegisteredSubs(
           ? error.message
           : 'Unknown pull error';
 
+      console.error(
+        `Databack pull error for ${serviceUrl}: ${reason}`,
+      );
       await env.DB.prepare(
         `
           UPDATE downstream_clients

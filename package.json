@@ -10,7 +10,6 @@
     "dev:worker": "wrangler dev --local --port 8787 --persist-to .wrangler/state",
     "build": "vite build",
     "deploy": "npm run build && wrangler deploy",
-    "key:derive-public": "node scripts/derive-public-key.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
