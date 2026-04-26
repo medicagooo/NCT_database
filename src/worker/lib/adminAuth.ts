@@ -2,7 +2,8 @@ import type { Context } from 'hono';
 import { readBearerToken } from './service-auth';
 
 const encoder = new TextEncoder();
-const PASSWORD_ITERATIONS = 210_000;
+// Cloudflare Workers rejects PBKDF2 iteration counts above 100,000.
+const PASSWORD_ITERATIONS = 100_000;
 const ADMIN_ID = 'admin';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 

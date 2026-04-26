@@ -236,6 +236,14 @@ app.get('/Console/*', async (context) => {
   return serveConsoleShell(context);
 });
 
+app.get('/console', async (context) => {
+  return serveConsoleShell(context);
+});
+
+app.get('/console/*', async (context) => {
+  return serveConsoleShell(context);
+});
+
 app.get('/assets/*', async (context) => {
   return context.env.ASSETS.fetch(context.req.raw);
 });

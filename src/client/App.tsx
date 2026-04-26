@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useState } from 'react';
+import { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import type { AdminSnapshot } from '../shared/types';
 import { apiRequest } from './api';
 
@@ -164,6 +164,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [adminConfigured, setAdminConfigured] = useState<boolean | null>(null);
   const [adminPassword, setAdminPassword] = useState('');
+  const [initialSetupPassword, setInitialSetupPassword] = useState('');
+  const [initialSetupPasswordConfirm, setInitialSetupPasswordConfirm] =
+    useState('');
+  const initialSetupPasswordRef = useRef<HTMLInputElement>(null);
   const [adminSessionToken, setAdminSessionToken] = useState(
     () => localStorage.getItem(STORAGE_KEYS.adminSession) ?? '',
   );
@@ -215,6 +219,12 @@ export default function App() {
   }, [ingestToken]);
 
   useEffect(() => {
+    if (adminConfigured === false) {
+      initialSetupPasswordRef.current?.focus();
+    }
+  }, [adminConfigured]);
+
+  useEffect(() => {
     async function initializeConsole() {
       setLoading(true);
       setError(null);
@@ -249,6 +259,37 @@ export default function App() {
 
     void initializeConsole();
   }, []);
+
+  async function handleInitialSetupSubmit(
+    event: React.FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+
+    if (initialSetupPassword !== initialSetupPasswordConfirm) {
+      setError('Password confirmation does not match.');
+      setMessage('Setup admin password failed.');
+      return;
+    }
+
+    await runAction('Setup admin password', async () => {
+      const response = await apiRequest<AdminAuthResponse>(
+        '/api/admin/auth/setup',
+        {
+          method: 'POST',
+          body: {
+            password: initialSetupPassword,
+          },
+        },
+      );
+
+      setAdminConfigured(true);
+      setInitialSetupPassword('');
+      setInitialSetupPasswordConfirm('');
+      setAdminSessionToken(response.sessionToken);
+      setMessage(`Console initialized. Admin session active until ${response.expiresAt}.`);
+      await loadSnapshot(response.sessionToken);
+    });
+  }
 
   async function handleAdminAuthSubmit(
     event: React.FormEvent<HTMLFormElement>,
@@ -406,6 +447,8 @@ export default function App() {
   }
 
   const overview = snapshot?.overview;
+  const showInitialSetupDialog =
+    adminConfigured === false && !adminSessionToken;
   const rawRows =
     snapshot?.rawRecords.map((record) => [
       record.recordKey,
@@ -444,6 +487,62 @@ export default function App() {
       <div className="bg-orb orb-a" />
       <div className="bg-orb orb-b" />
       <div className="bg-orb orb-c" />
+
+      {showInitialSetupDialog ? (
+        <div className="modal-backdrop">
+          <section
+            aria-labelledby="initial-setup-title"
+            aria-modal="true"
+            className="setup-dialog glass-panel"
+            role="dialog"
+          >
+            <span className="eyebrow">First Run</span>
+            <h2 id="initial-setup-title">Set admin password</h2>
+            <p>
+              Create the first administrator password to initialize the Console.
+            </p>
+            <form className="setup-form" onSubmit={handleInitialSetupSubmit}>
+              <label>
+                <span>Password</span>
+                <input
+                  autoComplete="new-password"
+                  minLength={12}
+                  onChange={(event) => setInitialSetupPassword(event.target.value)}
+                  placeholder="At least 12 characters"
+                  ref={initialSetupPasswordRef}
+                  type="password"
+                  value={initialSetupPassword}
+                />
+              </label>
+              <label>
+                <span>Confirm password</span>
+                <input
+                  autoComplete="new-password"
+                  minLength={12}
+                  onChange={(event) => setInitialSetupPasswordConfirm(event.target.value)}
+                  placeholder="Repeat password"
+                  type="password"
+                  value={initialSetupPasswordConfirm}
+                />
+              </label>
+              <button
+                className="primary-button"
+                disabled={
+                  busyAction !== null
+                  || !initialSetupPassword
+                  || !initialSetupPasswordConfirm
+                }
+                type="submit"
+              >
+                {busyAction === 'Setup admin password'
+                  ? 'Initializing...'
+                  : 'Initialize Console'}
+              </button>
+            </form>
+            {error ? <p className="dialog-error">{error}</p> : null}
+          </section>
+        </div>
+      ) : null}
 
       <header className="hero glass-panel">
         <div className="hero-copy">

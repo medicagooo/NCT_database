@@ -264,6 +264,70 @@ select {
   color: var(--danger);
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 9, 18, 0.66);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.setup-dialog {
+  width: min(100%, 440px);
+  border-radius: 24px;
+  padding: 28px;
+}
+
+.setup-dialog h2 {
+  margin: 10px 0 0;
+  font-family: 'Fraunces', Georgia, serif;
+  font-size: 2rem;
+}
+
+.setup-dialog p {
+  margin: 12px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.setup-form {
+  display: grid;
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.setup-form label {
+  display: grid;
+  gap: 8px;
+}
+
+.setup-form span {
+  color: rgba(234, 244, 255, 0.75);
+}
+
+.setup-form input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 16px;
+  background: rgba(10, 20, 36, 0.72);
+  color: #eaf4ff;
+  padding: 14px 16px;
+  outline: none;
+}
+
+.setup-form input:focus {
+  border-color: rgba(114, 241, 207, 0.45);
+}
+
+.dialog-error {
+  margin-bottom: 0;
+  color: var(--danger);
+}
+
 .content-grid {
   display: grid;
   gap: 24px;

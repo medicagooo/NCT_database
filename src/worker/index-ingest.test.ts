@@ -62,6 +62,38 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('Console shell routes', () => {
+  for (const path of ['/Console', '/Console/records', '/console', '/console/records']) {
+    it(`serves the Console shell for ${path}`, async () => {
+      const assetFetch = vi.fn().mockResolvedValue(
+        new Response('<div id="root"></div>', {
+          headers: {
+            'content-type': 'text/html',
+          },
+        }),
+      );
+      const env = {
+        ASSETS: {
+          fetch: assetFetch,
+        },
+      } as unknown as Env;
+
+      const response = await worker.fetch(
+        new Request(`https://mother.example.com${path}`),
+        env,
+        {} as ExecutionContext,
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('<div id="root"></div>');
+      expect(assetFetch).toHaveBeenCalledTimes(1);
+      expect(
+        (assetFetch.mock.calls[0]?.[0] as Request).url,
+      ).toBe('https://mother.example.com/index.html');
+    });
+  }
+});
+
 describe('/api/ingest', () => {
   it('schedules secure record communication when raw ingest updates data', async () => {
     const pushPromise = Promise.resolve([
