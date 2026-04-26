@@ -1,6 +1,7 @@
 import type {
   AdminSnapshot,
   AnalyticsOverview,
+  DataSourceType,
   DownstreamClient,
   IngestRecordInput,
   IngestResult,
@@ -46,6 +47,7 @@ import {
 } from './service-auth';
 
 type RawRecordRow = Record<string, unknown> & {
+  data_source_type?: string | null;
   id: string;
   record_key: string;
   source: string;
@@ -59,6 +61,7 @@ type RawRecordRow = Record<string, unknown> & {
 };
 
 type SecureRecordRow = Record<string, unknown> & {
+  data_source_type?: string | null;
   id: string;
   raw_record_id: string;
   record_key: string;
@@ -118,6 +121,10 @@ const SUB_EXPORT_PATH = '/api/export/nct_databack';
 const CURRENT_ENCRYPTION_KEY_VERSION = 1;
 const SUB_FORM_SOURCE_PREFIX = 'sub-form:';
 const SUB_RECOVERY_SOURCE_PREFIX = 'sub-recovery:';
+const DATA_SOURCE_TYPES = new Set<DataSourceType>([
+  'questionnaire',
+  'batch_query',
+]);
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -297,11 +304,77 @@ function collectFieldNames(
   );
 }
 
+function isJsonObject(value: JsonValue | undefined): value is JsonObject {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readSubmittedFields(values: Record<string, JsonValue>): JsonObject {
+  return isJsonObject(values.submittedFields) ? values.submittedFields : {};
+}
+
+function collectPayloadFieldNames(...payloads: JsonObject[]): string[] {
+  return collectFieldNames(
+    ...payloads.flatMap((payload) => [
+      Object.keys(payload),
+      Object.keys(readSubmittedFields(payload)),
+    ]),
+  );
+}
+
 function hasOwn(
   value: object,
   key: string,
 ): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function readDynamicFieldValue(
+  values: Record<string, JsonValue>,
+  fieldName: string,
+): JsonValue | undefined {
+  if (hasOwn(values, fieldName)) {
+    return values[fieldName];
+  }
+
+  const submittedFields = readSubmittedFields(values);
+  return hasOwn(submittedFields, fieldName)
+    ? submittedFields[fieldName]
+    : undefined;
+}
+
+function normalizeDataSourceType(
+  value: unknown,
+  fallback: DataSourceType,
+): DataSourceType {
+  return typeof value === 'string' && DATA_SOURCE_TYPES.has(value as DataSourceType)
+    ? value as DataSourceType
+    : fallback;
+}
+
+function inferDataSourceType(
+  payload: JsonObject,
+  source = '',
+): DataSourceType {
+  const payloadSource = typeof payload.source === 'string' ? payload.source : '';
+  const recordKind = typeof payload.recordKind === 'string' ? payload.recordKind : '';
+  const publicData = isJsonObject(payload.publicData) ? payload.publicData : {};
+
+  if (
+    source.startsWith(SUB_FORM_SOURCE_PREFIX)
+    || source.startsWith('admin-questionnaire-import')
+    || payloadSource === 'No-Torsion'
+    || recordKind.startsWith('no_torsion_')
+    || isJsonObject(payload.submittedFields)
+    || publicData.source === 'No-Torsion'
+    || (
+      typeof publicData.recordKind === 'string'
+      && publicData.recordKind.startsWith('no_torsion_')
+    )
+  ) {
+    return 'questionnaire';
+  }
+
+  return 'batch_query';
 }
 
 function buildDynamicAssignments(
@@ -310,29 +383,45 @@ function buildDynamicAssignments(
   values: Record<string, JsonValue>,
 ): ColumnAssignment[] {
   // When a field exists in the evolving schema but not in this payload, write NULL so old values do not linger on update.
-  return collectFieldNames(fieldNames).flatMap((fieldName) => {
+  const assignmentsByColumn = new Map<string, ColumnAssignment>();
+
+  for (const fieldName of collectFieldNames(fieldNames)) {
     const column = mappings.get(fieldName);
     if (!column) {
-      return [];
+      continue;
     }
 
-    return [
-      {
+    const fieldValue = readDynamicFieldValue(values, fieldName);
+    const value =
+      fieldValue === undefined
+        ? null
+        : serializeDynamicColumnValue(fieldValue);
+    const existingAssignment = assignmentsByColumn.get(column);
+
+    if (!existingAssignment || (existingAssignment.value === null && value !== null)) {
+      assignmentsByColumn.set(column, {
         column,
-        value: hasOwn(values, fieldName)
-          ? serializeDynamicColumnValue(values[fieldName])
-          : null,
-      },
-    ];
-  });
+        value,
+      });
+    }
+  }
+
+  return Array.from(assignmentsByColumn.values()).sort((left, right) =>
+    left.column.localeCompare(right.column),
+  );
 }
 
 function mapRawRecord(
   row: RawRecordRow,
 ): RawRecord {
   const payload = parseJsonObject(row.payload_json);
+  const dataSourceType = normalizeDataSourceType(
+    row.data_source_type,
+    inferDataSourceType(payload, row.source),
+  );
 
   return {
+    dataSourceType,
     id: row.id,
     recordKey: row.record_key,
     source: row.source,
@@ -341,7 +430,7 @@ function mapRawRecord(
     payloadColumns: extractDynamicColumns(
       row,
       'payload',
-      Object.keys(payload),
+      collectPayloadFieldNames(payload),
     ),
     payloadHash: row.payload_hash,
     receivedAt: row.received_at,
@@ -356,8 +445,13 @@ function mapSecureRecord(
 ): SecureRecord {
   const publicData = parseJsonObject(row.public_json);
   const encryptFields = parseStringArray(row.encrypt_fields_json);
+  const dataSourceType = normalizeDataSourceType(
+    row.data_source_type,
+    inferDataSourceType(publicData),
+  );
 
   return {
+    dataSourceType,
     id: row.id,
     rawRecordId: row.raw_record_id,
     recordKey: row.record_key,
@@ -367,7 +461,7 @@ function mapSecureRecord(
     publicColumns: extractDynamicColumns(
       row,
       'public',
-      Object.keys(publicData),
+      collectPayloadFieldNames(publicData),
     ),
     encryptedData: JSON.parse(row.encrypted_json),
     encryptedColumns: extractDynamicColumns(
@@ -487,6 +581,7 @@ function mapSecureRecordToSubPushRecord(
   record: SecureRecord,
 ): SubPushRecord {
   return {
+    dataSourceType: record.dataSourceType,
     recordKey: record.recordKey,
     version: record.version,
     fingerprint: record.fingerprint,
@@ -740,6 +835,7 @@ export async function ingestSubFormRecords(
   for (const record of request.records) {
     const [ingested] = await ingestRecords(env, [
       {
+        dataSourceType: 'questionnaire',
         payload: record.payload,
         recordKey: record.recordKey,
         source: `${SUB_FORM_SOURCE_PREFIX}${request.serviceUrl}`,
@@ -857,6 +953,10 @@ export async function ingestRecords(
     const payload = toJsonObject(rawInput.payload);
     const recordKey = readRecordKey(rawInput);
     const source = rawInput.source?.trim() || 'downstream';
+    const dataSourceType = normalizeDataSourceType(
+      rawInput.dataSourceType,
+      inferDataSourceType(payload, source),
+    );
     const payloadJson = stableStringify(payload);
     const fingerprint = await computeRecordContentFingerprint(payload);
     const payloadHash = fingerprint;
@@ -905,13 +1005,23 @@ export async function ingestRecords(
       payload,
       encryptFields,
     );
-    const rawFieldNames = collectFieldNames(
-      previousFieldNames,
-      Object.keys(payload),
+    const rawFieldNames = collectPayloadFieldNames(
+      previousPayload,
+      payload,
     );
-    const publicFieldNames = collectFieldNames(
-      previousPublicFieldNames,
-      Object.keys(publicData),
+    const previousPublicPayload = previousPublicFieldNames.reduce<JsonObject>(
+      (accumulator, fieldName) => {
+        if (hasOwn(previousPayload, fieldName)) {
+          accumulator[fieldName] = previousPayload[fieldName];
+        }
+
+        return accumulator;
+      },
+      {},
+    );
+    const publicFieldNames = collectPayloadFieldNames(
+      previousPublicPayload,
+      publicData,
     );
     const encryptedFieldNames = collectFieldNames(
       previousEncryptedFieldNames,
@@ -937,6 +1047,7 @@ export async function ingestRecords(
     );
     const currentVersion = await getCurrentVersion(env.DB);
     const hasChanged = existingSecure?.fingerprint !== fingerprint;
+    const dataSourceTypeChanged = existingSecure?.data_source_type !== dataSourceType;
     const nextVersion = existingSecure
       ? hasChanged
         ? deriveRecordContentVersion(currentVersion, fingerprint)
@@ -969,6 +1080,7 @@ export async function ingestRecords(
     if (existingRaw) {
       const updateColumns = [
         'source',
+        'data_source_type',
         'version',
         'payload_json',
         'payload_hash',
@@ -980,6 +1092,7 @@ export async function ingestRecords(
       ];
       const updateValues = [
         source,
+        dataSourceType,
         nextVersion,
         payloadJson,
         payloadHash,
@@ -1005,6 +1118,7 @@ export async function ingestRecords(
         'id',
         'record_key',
         'source',
+        'data_source_type',
         'version',
         'payload_json',
         'payload_hash',
@@ -1019,6 +1133,7 @@ export async function ingestRecords(
         rawRecordId,
         recordKey,
         source,
+        dataSourceType,
         nextVersion,
         payloadJson,
         payloadHash,
@@ -1057,6 +1172,7 @@ export async function ingestRecords(
         'id',
         'raw_record_id',
         'record_key',
+        'data_source_type',
         'version',
         'key_version',
         'public_json',
@@ -1076,6 +1192,7 @@ export async function ingestRecords(
         secureRecordId,
         rawRecordId,
         recordKey,
+        dataSourceType,
         nextVersion,
         keyVersion,
         publicJson,
@@ -1100,9 +1217,10 @@ export async function ingestRecords(
       )
         .bind(...insertValues)
         .run();
-    } else if (hasChanged) {
+    } else if (hasChanged || dataSourceTypeChanged) {
       const updateColumns = [
         'raw_record_id',
+        'data_source_type',
         'version',
         'key_version',
         'public_json',
@@ -1119,6 +1237,7 @@ export async function ingestRecords(
       ];
       const updateValues = [
         rawRecordId,
+        dataSourceType,
         nextVersion,
         keyVersion,
         publicJson,
@@ -1163,7 +1282,7 @@ export async function ingestRecords(
       secureRecordId,
       version: nextVersion,
       fingerprint,
-      updated: !existingSecure || hasChanged,
+      updated: !existingSecure || hasChanged || dataSourceTypeChanged,
     });
   }
 
@@ -1178,6 +1297,7 @@ export async function rebuildSecureRecords(
   return ingestRecords(
     env,
     rawRecords.map((record) => ({
+      dataSourceType: record.dataSourceType,
       recordKey: record.recordKey,
       source: record.source,
       payload: record.payload,
@@ -1363,6 +1483,7 @@ async function computeSecureTransferFingerprint(
 async function upsertRawRecord(
   env: Env,
   input: {
+    dataSourceType?: DataSourceType;
     fingerprint?: string;
     payload: JsonObject;
     recordKey: string;
@@ -1374,6 +1495,10 @@ async function upsertRawRecord(
   id: string;
 }> {
   const payload = toJsonObject(input.payload);
+  const dataSourceType = normalizeDataSourceType(
+    input.dataSourceType,
+    inferDataSourceType(payload, input.source),
+  );
   const payloadJson = stableStringify(payload);
   const payloadHash = input.fingerprint ?? await computeRecordContentFingerprint(payload);
   const inputVersion = Number(input.version);
@@ -1394,9 +1519,9 @@ async function upsertRawRecord(
   const previousPayload = existingRaw
     ? parseJsonObject(existingRaw.payload_json)
     : {};
-  const rawFieldNames = collectFieldNames(
-    Object.keys(previousPayload),
-    Object.keys(payload),
+  const rawFieldNames = collectPayloadFieldNames(
+    previousPayload,
+    payload,
   );
   const rawColumnMappings = await ensureDynamicColumns(
     env.DB,
@@ -1414,6 +1539,7 @@ async function upsertRawRecord(
   if (existingRaw) {
     const updateColumns = [
       'source',
+      'data_source_type',
       'version',
       'payload_json',
       'payload_hash',
@@ -1423,6 +1549,7 @@ async function upsertRawRecord(
     ];
     const updateValues = [
       input.source,
+      dataSourceType,
       version,
       payloadJson,
       payloadHash,
@@ -1442,6 +1569,7 @@ async function upsertRawRecord(
       'id',
       'record_key',
       'source',
+      'data_source_type',
       'version',
       'payload_json',
       'payload_hash',
@@ -1454,6 +1582,7 @@ async function upsertRawRecord(
       rawRecordId,
       input.recordKey,
       input.source,
+      dataSourceType,
       version,
       payloadJson,
       payloadHash,
@@ -1506,8 +1635,13 @@ async function upsertRecoveredSecureTransferRecord(
     ...record.payload.publicData,
     ...secretData,
   };
+  const dataSourceType = normalizeDataSourceType(
+    record.dataSourceType,
+    inferDataSourceType(record.payload.publicData, `${SUB_RECOVERY_SOURCE_PREFIX}${serviceUrl}`),
+  );
   const receivedAt = typeof record.updatedAt === 'string' ? record.updatedAt : nowIso();
   const rawRecord = await upsertRawRecord(env, {
+    dataSourceType,
     fingerprint: record.fingerprint,
     payload: rawPayload,
     recordKey: record.recordKey,
@@ -1546,9 +1680,9 @@ async function upsertRecoveredSecureTransferRecord(
   const previousEncryptedFieldNames = Object.keys({
     ...secretData,
   }).filter((fieldName) => previousEncryptedFieldSet.has(fieldName));
-  const publicFieldNames = collectFieldNames(
-    Object.keys(previousPublicData),
-    Object.keys(record.payload.publicData),
+  const publicFieldNames = collectPayloadFieldNames(
+    previousPublicData,
+    record.payload.publicData,
   );
   const encryptedFieldNames = collectFieldNames(
     previousEncryptedFieldNames,
@@ -1593,6 +1727,7 @@ async function upsertRecoveredSecureTransferRecord(
   if (existingSecure) {
     const updateColumns = [
       'raw_record_id',
+      'data_source_type',
       'version',
       'key_version',
       'public_json',
@@ -1606,6 +1741,7 @@ async function upsertRecoveredSecureTransferRecord(
     ];
     const updateValues = [
       rawRecord.id,
+      dataSourceType,
       Number(record.version),
       Math.max(1, Number(record.payload.keyVersion)),
       publicJson,
@@ -1629,6 +1765,7 @@ async function upsertRecoveredSecureTransferRecord(
       'id',
       'raw_record_id',
       'record_key',
+      'data_source_type',
       'version',
       'key_version',
       'public_json',
@@ -1645,6 +1782,7 @@ async function upsertRecoveredSecureTransferRecord(
       secureRecordId,
       rawRecord.id,
       record.recordKey,
+      dataSourceType,
       Number(record.version),
       Math.max(1, Number(record.payload.keyVersion)),
       publicJson,
@@ -1736,6 +1874,10 @@ async function importSubDatabackExportFile(
 
     const [result] = await ingestRecords(env, [
       {
+        dataSourceType: normalizeDataSourceType(
+          record.dataSourceType,
+          inferDataSourceType(payload, `${SUB_RECOVERY_SOURCE_PREFIX}${serviceUrl}`),
+        ),
         payload,
         recordKey: record.recordKey,
         source: `${SUB_RECOVERY_SOURCE_PREFIX}${serviceUrl}`,

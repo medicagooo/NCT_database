@@ -498,9 +498,16 @@ describe('ingestSubFormRecords', () => {
       submittedFields,
     });
     expect(rawInsert!.params[rawInsert!.columns.indexOf('version')]).toBe(2);
+    expect(rawInsert!.params[rawInsert!.columns.indexOf('data_source_type')]).toBe('questionnaire');
+    expect(secureInsert!.params[secureInsert!.columns.indexOf('data_source_type')]).toBe('questionnaire');
     expect(secureInsert!.params[secureInsert!.columns.indexOf('version')]).toBe(2);
     expect(rawInsert!.params).toContain(JSON.stringify(submittedFields));
     expect(secureInsert!.params).toContain(JSON.stringify(submittedFields));
+    expect(rawInsert!.columns).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^payload_字段_future_question_[a-z0-9]+$/),
+      ]),
+    );
   });
 
   it('keeps raw updates, encrypted secure records, versions, and sub pushes in sync', async () => {
@@ -604,7 +611,7 @@ describe('ingestSubFormRecords', () => {
     ).toEqual(
       expect.arrayContaining([
         expect.arrayContaining([
-          expect.stringMatching(/^encrypted_contact_/),
+          'encrypted_机构联络方式',
           JSON.stringify({
             algorithm: 'AES-GCM',
             ciphertext: 'encrypted:contact',
@@ -612,7 +619,7 @@ describe('ingestSubFormRecords', () => {
           }),
         ]),
         expect.arrayContaining([
-          expect.stringMatching(/^encrypted_name_/),
+          'encrypted_机构名称',
           JSON.stringify({
             algorithm: 'AES-GCM',
             ciphertext: 'encrypted:name',

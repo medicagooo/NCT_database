@@ -1,14 +1,15 @@
-import type { IngestRecordInput, JsonObject, JsonValue } from '../../shared/types';
+import type { DataSourceType, IngestRecordInput, JsonObject, JsonValue } from '../../shared/types';
 import { sha256 } from './crypto';
 import { stableStringify } from './json';
 
 type ColumnHandler = {
   keys?: string[];
   apply?: (payload: JsonObject, value: string) => void;
-  kind?: 'payload' | 'record-key' | 'source';
+  kind?: 'data-source-type' | 'payload' | 'record-key' | 'source';
 };
 
 export type ParsedImportRecord = {
+  dataSourceType: DataSourceType;
   payload: JsonObject;
   recordKey: string;
   rowNumber: number;
@@ -30,6 +31,7 @@ export type ParsedTabularImport = {
 };
 
 const defaultImportSource = 'admin-tabular-import';
+const defaultImportDataSourceType: DataSourceType = 'batch_query';
 const maxImportSourceLength = 120;
 const maxCellTextLength = 8000;
 
@@ -52,6 +54,38 @@ function compactHeader(value: string): string {
 
 function normalizeCell(value: string): string {
   return value.trim().slice(0, maxCellTextLength);
+}
+
+function normalizeDataSourceType(
+  value: string,
+  fallback: DataSourceType,
+): DataSourceType {
+  const normalized = normalizeHeader(value).replace(/[\s_-]+/g, '');
+
+  if (
+    normalized === 'questionnaire'
+    || normalized === '问卷'
+    || normalized === '問卷'
+    || normalized === '问卷数据'
+    || normalized === '問卷資料'
+    || normalized === '表单'
+    || normalized === '表單'
+  ) {
+    return 'questionnaire';
+  }
+
+  if (
+    normalized === 'batchquery'
+    || normalized === 'batch'
+    || normalized === '批量查询'
+    || normalized === '批量查詢'
+    || normalized === '批量查询数据'
+    || normalized === '批量查詢資料'
+  ) {
+    return 'batch_query';
+  }
+
+  return fallback;
 }
 
 function parseNumber(value: string): number | null {
@@ -180,6 +214,12 @@ const columnHandlers: Record<string, ColumnHandler> = {
   source: { kind: 'source' },
   来源: { kind: 'source' },
   数据来源: { kind: 'source' },
+  datasource_type: { kind: 'data-source-type' },
+  data_source_type: { kind: 'data-source-type' },
+  数据来源类型: { kind: 'data-source-type' },
+  数据类型: { kind: 'data-source-type' },
+  來源類型: { kind: 'data-source-type' },
+  資料類型: { kind: 'data-source-type' },
   机构名称: textHandler('name', 'schoolName'),
   機構名稱: textHandler('name', 'schoolName'),
   机构名: textHandler('name', 'schoolName'),
@@ -457,6 +497,10 @@ function buildRecognizedColumns(
       return [{ columns: ['source'], name: header }];
     }
 
+    if (handler.kind === 'data-source-type') {
+      return [{ columns: ['dataSourceType'], name: header }];
+    }
+
     return [
       {
         columns: handler.keys ?? [],
@@ -497,6 +541,7 @@ async function buildRecordKey(payload: JsonObject): Promise<string> {
 export async function parseTabularImport(
   text: string,
   options: {
+    dataSourceType?: DataSourceType;
     source?: string;
   } = {},
 ): Promise<ParsedTabularImport> {
@@ -525,6 +570,7 @@ export async function parseTabularImport(
   const defaultSource = normalizeCell(options.source ?? defaultImportSource)
     || defaultImportSource;
   const limitedDefaultSource = defaultSource.slice(0, maxImportSourceLength);
+  const defaultDataSourceType = options.dataSourceType ?? defaultImportDataSourceType;
   const seenRecordKeys = new Set<string>();
   const records: IngestRecordInput[] = [];
   const previewRecords: ParsedImportRecord[] = [];
@@ -533,6 +579,7 @@ export async function parseTabularImport(
 
   for (const [rowIndex, row] of table.slice(1).entries()) {
     const payload: JsonObject = {};
+    let dataSourceType = defaultDataSourceType;
     let recordKey = '';
     let source = limitedDefaultSource;
 
@@ -554,6 +601,11 @@ export async function parseTabularImport(
         return;
       }
 
+      if (handler.kind === 'data-source-type') {
+        dataSourceType = normalizeDataSourceType(value, defaultDataSourceType);
+        return;
+      }
+
       handler.apply?.(payload, value);
     });
 
@@ -570,11 +622,13 @@ export async function parseTabularImport(
 
     seenRecordKeys.add(resolvedRecordKey);
     records.push({
+      dataSourceType,
       payload,
       recordKey: resolvedRecordKey,
       source,
     });
     previewRecords.push({
+      dataSourceType,
       payload,
       recordKey: resolvedRecordKey,
       rowNumber: rowIndex + 2,

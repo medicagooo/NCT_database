@@ -9,6 +9,10 @@ export type JsonObject = {
   [key: string]: JsonValue;
 };
 
+export type DataSourceType =
+  | 'questionnaire'
+  | 'batch_query';
+
 export interface AesGcmEncryptedEnvelope {
   algorithm: 'AES-GCM';
   iv: string;
@@ -26,6 +30,7 @@ export interface SecureTransferPayload {
 }
 
 export interface RawRecord {
+  dataSourceType: DataSourceType;
   id: string;
   recordKey: string;
   source: string;
@@ -40,6 +45,7 @@ export interface RawRecord {
 }
 
 export interface SecureRecord {
+  dataSourceType: DataSourceType;
   id: string;
   rawRecordId: string;
   recordKey: string;
@@ -120,6 +126,7 @@ export interface SubFormRecordsResponse {
 }
 
 export interface IngestRecordInput {
+  dataSourceType?: DataSourceType;
   recordKey?: string;
   source?: string;
   encryptFields?: string[];
@@ -156,6 +163,7 @@ export interface SyncPayload {
 }
 
 export interface SubPushRecord {
+  dataSourceType: DataSourceType;
   recordKey: string;
   version: number;
   fingerprint: string;
@@ -173,6 +181,7 @@ export interface SubPushPayload {
 }
 
 export interface SubDatabackExportRecord {
+  dataSourceType?: DataSourceType;
   payload: JsonObject | SecureTransferPayload;
   payloadEncryptionState: 'plain-json' | 'secure-transfer';
   recordKey: string;

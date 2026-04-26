@@ -209,6 +209,32 @@ select {
   gap: 12px;
 }
 
+.segmented-control {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px;
+  gap: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.segmented-control button {
+  border: 0;
+  border-radius: 999px;
+  padding: 10px 14px;
+  background: transparent;
+  color: rgba(234, 244, 255, 0.76);
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease;
+}
+
+.segmented-control button.active {
+  background: rgba(255, 255, 255, 0.18);
+  color: #eaf4ff;
+}
+
 .primary-button,
 .secondary-button {
   border: 0;

@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect, useRef, useState } from 'react';
-import type { AdminSnapshot } from '../shared/types';
+import type { AdminSnapshot, DataSourceType } from '../shared/types';
 import { apiRequest } from './api';
 
 const AnalyticsSection = lazy(() => import('./AnalyticsSection'));
@@ -25,6 +25,7 @@ type TabularImportResponse = {
   inputRowCount: number;
   parsedRowCount: number;
   previewRecords: Array<{
+    dataSourceType: DataSourceType;
     payload: Record<string, unknown>;
     recordKey: string;
     rowNumber: number;
@@ -67,6 +68,11 @@ const sampleTabularImport = [
   '| --- | --- | --- | --- | --- | --- |',
   '| 示例机构 | 示例地址 | 广东 | 广州 | 23.129110, 113.264385 | 示例经历 |',
 ].join('\n');
+
+const importSourceDefaults: Record<DataSourceType, string> = {
+  questionnaire: 'admin-questionnaire-import',
+  batch_query: 'admin-batch-query-import',
+};
 
 function truncate(
   value: string,
@@ -176,7 +182,11 @@ export default function App() {
   );
   const [ingestPayload, setIngestPayload] = useState(sampleIngestPayload);
   const [tabularImportText, setTabularImportText] = useState(sampleTabularImport);
-  const [tabularImportSource, setTabularImportSource] = useState('admin-tabular-import');
+  const [tabularImportDataSourceType, setTabularImportDataSourceType] =
+    useState<DataSourceType>('questionnaire');
+  const [tabularImportSource, setTabularImportSource] = useState(
+    importSourceDefaults.questionnaire,
+  );
   const [tabularImportPreview, setTabularImportPreview] =
     useState<TabularImportResponse | null>(null);
 
@@ -380,6 +390,7 @@ export default function App() {
           method: 'POST',
           token: adminSessionToken || undefined,
           body: {
+            dataSourceType: tabularImportDataSourceType,
             dryRun,
             source: tabularImportSource,
             text: tabularImportText,
@@ -397,6 +408,17 @@ export default function App() {
         await loadSnapshot();
       }
     });
+  }
+
+  function handleTabularImportTypeChange(
+    nextType: DataSourceType,
+  ) {
+    setTabularImportDataSourceType(nextType);
+    setTabularImportSource((currentSource) => {
+      const knownDefault = Object.values(importSourceDefaults).includes(currentSource);
+      return knownDefault ? importSourceDefaults[nextType] : currentSource;
+    });
+    setTabularImportPreview(null);
   }
 
   async function handleRebuild() {
@@ -453,6 +475,7 @@ export default function App() {
     snapshot?.rawRecords.map((record) => [
       record.recordKey,
       String(record.version),
+      record.dataSourceType,
       record.source,
       truncate(record.receivedAt, 30),
       truncate(toPrettyJson(record.payload), 120),
@@ -463,6 +486,7 @@ export default function App() {
     snapshot?.secureRecords.map((record) => [
       record.recordKey,
       String(record.version),
+      record.dataSourceType,
       record.encryptFields.join(', ') || 'none',
       truncate(toPrettyJson(record.publicData), 100),
       truncate(toPrettyJson(record.publicColumns), 100),
@@ -705,6 +729,22 @@ export default function App() {
               }}
             >
               <h3>粘贴表格导入 raw_records</h3>
+              <div className="segmented-control" role="group" aria-label="Import data source">
+                <button
+                  type="button"
+                  className={tabularImportDataSourceType === 'questionnaire' ? 'active' : ''}
+                  onClick={() => handleTabularImportTypeChange('questionnaire')}
+                >
+                  问卷数据导入
+                </button>
+                <button
+                  type="button"
+                  className={tabularImportDataSourceType === 'batch_query' ? 'active' : ''}
+                  onClick={() => handleTabularImportTypeChange('batch_query')}
+                >
+                  批量查询数据导入
+                </button>
+              </div>
               <label>
                 <span>Source</span>
                 <input
@@ -754,6 +794,7 @@ export default function App() {
                       <thead>
                         <tr>
                           <th>row</th>
+                          <th>type</th>
                           <th>recordKey</th>
                           <th>payload</th>
                         </tr>
@@ -762,6 +803,7 @@ export default function App() {
                         {tabularImportPreview.previewRecords.slice(0, 5).map((record) => (
                           <tr key={`${record.rowNumber}-${record.recordKey}`}>
                             <td>{record.rowNumber}</td>
+                            <td>{record.dataSourceType}</td>
                             <td>{truncate(record.recordKey, 40)}</td>
                             <td>{truncate(toPrettyJson(record.payload), 120)}</td>
                           </tr>
@@ -811,12 +853,12 @@ export default function App() {
         <section className="table-grid">
           <TableBlock
             title="Raw table"
-            columns={['recordKey', 'version', 'source', 'receivedAt', 'payload', 'payloadColumns']}
+            columns={['recordKey', 'version', 'dataSourceType', 'source', 'receivedAt', 'payload', 'payloadColumns']}
             rows={rawRows}
           />
           <TableBlock
             title="Secure table"
-            columns={['recordKey', 'version', 'encryptFields', 'publicData', 'publicColumns', 'encryptedColumns']}
+            columns={['recordKey', 'version', 'dataSourceType', 'encryptFields', 'publicData', 'publicColumns', 'encryptedColumns']}
             rows={secureRows}
           />
           <TableBlock

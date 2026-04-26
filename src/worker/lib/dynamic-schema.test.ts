@@ -51,6 +51,21 @@ function createFakeDb(
 }
 
 describe('dynamic schema helpers', () => {
+  it('uses questionnaire question names for known fields', async () => {
+    const { db } = createFakeDb();
+    const mappings = await ensureDynamicColumns(
+      db,
+      'raw_records',
+      'payload',
+      ['schoolName', 'school_name', 'longitude', 'latitude'],
+    );
+
+    expect(mappings.get('schoolName')).toBe('payload_机构名称');
+    expect(mappings.get('school_name')).toBe('payload_机构名称');
+    expect(mappings.get('longitude')).toBe('payload_经度');
+    expect(mappings.get('latitude')).toBe('payload_纬度');
+  });
+
   it('adds missing dynamic columns once per trimmed field name', async () => {
     const { db, sqlLog } = createFakeDb([
       'id',
@@ -69,6 +84,7 @@ describe('dynamic schema helpers', () => {
       'full name',
     ]);
     expect([...mappings.values()]).toHaveLength(2);
+    expect(mappings.get('Email')).toMatch(/^payload_字段_email_[a-z0-9]+$/);
     expect(
       sqlLog.filter((sql) => sql.includes('ALTER TABLE')),
     ).toHaveLength(2);

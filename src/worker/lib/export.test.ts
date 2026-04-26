@@ -42,6 +42,7 @@ const sampleSnapshot: AdminSnapshot = {
   },
   rawRecords: [
     {
+      dataSourceType: 'batch_query',
       id: 'raw-1',
       recordKey: 'patient-1',
       source: 'hospital-a',
@@ -62,6 +63,7 @@ const sampleSnapshot: AdminSnapshot = {
   ],
   secureRecords: [
     {
+      dataSourceType: 'batch_query',
       id: 'secure-1',
       rawRecordId: 'raw-1',
       recordKey: 'patient-1',

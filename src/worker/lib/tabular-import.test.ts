@@ -9,7 +9,7 @@ describe('parseTabularImport', () => {
         '测试机构\t测试地址\t广东\t23.129110, 113.264385\t忽略我',
         '测试机构\t测试地址\t广东\t23.129110, 113.264385\t重复行',
       ].join('\n'),
-      { source: 'manual-test' },
+      { dataSourceType: 'batch_query', source: 'manual-test' },
     );
 
     expect(result.inputRowCount).toBe(2);
@@ -17,6 +17,7 @@ describe('parseTabularImport', () => {
     expect(result.duplicateRowCount).toBe(1);
     expect(result.unknownColumns).toEqual(['未知列']);
     expect(result.records[0]).toMatchObject({
+      dataSourceType: 'batch_query',
       recordKey: expect.stringMatching(/^admin-import:[a-f0-9]{32}$/),
       source: 'manual-test',
       payload: {
@@ -45,6 +46,7 @@ describe('parseTabularImport', () => {
     expect(result.unknownColumns).toEqual([]);
     expect(result.records).toHaveLength(1);
     expect(result.records[0]).toMatchObject({
+      dataSourceType: 'batch_query',
       recordKey: 'school-1',
       payload: {
         HMaster: '张三',
@@ -76,6 +78,25 @@ describe('parseTabularImport', () => {
       schoolCoordinates: '23.1, 113.2',
       scandal: ['體罰', '辱罵'],
       violenceCategories: ['體罰', '辱罵'],
+    });
+  });
+
+  it('marks questionnaire imports separately from batch query imports', async () => {
+    const result = await parseTabularImport(
+      [
+        '记录编号\t机构名称\t数据来源类型',
+        'school-2\t问卷机构\t问卷数据',
+      ].join('\n'),
+      { dataSourceType: 'batch_query', source: 'manual-test' },
+    );
+
+    expect(result.records[0]).toMatchObject({
+      dataSourceType: 'questionnaire',
+      recordKey: 'school-2',
+      source: 'manual-test',
+    });
+    expect(result.previewRecords[0]).toMatchObject({
+      dataSourceType: 'questionnaire',
     });
   });
 });

@@ -34,6 +34,7 @@ const ingestSchema = z.object({
   records: z
     .array(
       z.object({
+        dataSourceType: z.enum(['questionnaire', 'batch_query']).optional(),
         recordKey: z.string().optional(),
         source: z.string().optional(),
         encryptFields: z.array(z.string()).optional(),
@@ -149,6 +150,7 @@ function buildFakeFormResults(request: ParsedSubFormRecords) {
 }
 
 const tabularImportSchema = z.object({
+  dataSourceType: z.enum(['questionnaire', 'batch_query']).optional(),
   dryRun: z.boolean().optional(),
   source: z.string().max(120).optional(),
   text: z.string().min(1),
@@ -527,6 +529,7 @@ app.post('/api/admin/import-table', async (context) => {
   }
 
   const importPlan = await parseTabularImport(parsed.data.text, {
+    dataSourceType: parsed.data.dataSourceType,
     source: parsed.data.source,
   });
 
