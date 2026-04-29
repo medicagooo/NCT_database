@@ -145,6 +145,7 @@ export interface SchoolMediaRecord {
   sourceServiceUrl: string;
   sourceMediaId: string;
   objectKey: string;
+  localObjectKey: string | null;
   publicUrl: string;
   mediaType: 'image' | 'video';
   contentType: string;
@@ -160,6 +161,7 @@ export interface SchoolMediaRecord {
   status: SchoolMediaStatus;
   reviewNote: string | null;
   uploadedAt: string | null;
+  objectSyncedAt: string | null;
   reviewedAt: string | null;
   sourceUpdatedAt: string;
   createdAt: string;

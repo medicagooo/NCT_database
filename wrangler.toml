@@ -22,3 +22,16 @@ binding = "DB"
 database_name = "nct-database"
 database_id = "f6de668e-9666-4d9d-8854-9dfe25fb17ad"
 migrations_dir = "./migrations"
+
+[[r2_buckets]]
+binding = "EXPORT_BUCKET"
+bucket_name = "nct-database-exports"
+preview_bucket_name = "nct-database-exports-preview"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "nct-database-media"
+preview_bucket_name = "nct-database-media-preview"
+
+[triggers]
+crons = ["0 18 * * *", "0 * * * *"]

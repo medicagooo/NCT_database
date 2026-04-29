@@ -128,6 +128,7 @@ type SchoolMediaRow = {
   source_service_url: string;
   source_media_id: string;
   object_key: string;
+  local_object_key: string | null;
   public_url: string;
   media_type: 'image' | 'video';
   content_type: string;
@@ -143,6 +144,7 @@ type SchoolMediaRow = {
   status: SchoolMediaStatus;
   review_note: string | null;
   uploaded_at: string | null;
+  object_synced_at: string | null;
   reviewed_at: string | null;
   source_updated_at: string;
   created_at: string;
@@ -633,6 +635,7 @@ async function mapSchoolMediaRecord(
     sourceServiceUrl: row.source_service_url,
     sourceMediaId: row.source_media_id,
     objectKey: row.object_key,
+    localObjectKey: row.local_object_key,
     publicUrl: row.public_url,
     mediaType: row.media_type,
     contentType: row.content_type,
@@ -648,6 +651,7 @@ async function mapSchoolMediaRecord(
     status: row.status,
     reviewNote: row.review_note,
     uploadedAt: row.uploaded_at,
+    objectSyncedAt: row.object_synced_at,
     reviewedAt: row.reviewed_at,
     sourceUpdatedAt: row.source_updated_at,
     createdAt: row.created_at,
@@ -1127,7 +1131,7 @@ export async function ingestSubMediaRecords(
           isR18: Boolean(existing.is_r18),
           objectKey: existing.object_key,
           province: existing.province,
-          publicUrl: existing.public_url,
+          publicUrl: existing.local_object_key ? record.publicUrl : existing.public_url,
           schoolAddress: existing.school_address,
           schoolName: existing.school_name,
           schoolNameNorm: existing.school_name_norm,
@@ -1169,7 +1173,11 @@ export async function ingestSubMediaRecords(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?, ?, ?)
         ON CONFLICT(source_service_url, source_media_id) DO UPDATE SET
           object_key = excluded.object_key,
-          public_url = excluded.public_url,
+          public_url = CASE
+            WHEN school_media.local_object_key IS NOT NULL
+              THEN school_media.public_url
+            ELSE excluded.public_url
+          END,
           media_type = excluded.media_type,
           content_type = excluded.content_type,
           byte_size = excluded.byte_size,

@@ -292,3 +292,54 @@ describe('/api/sub/form-records', () => {
     expect(executionCtx.waitUntil).not.toHaveBeenCalled();
   });
 });
+
+describe('/api/sub/media-objects', () => {
+  it('returns fake success for unverifiable media object sync requests without storing data', async () => {
+    const put = vi.fn();
+    const env = {
+      MEDIA_BUCKET: {
+        put,
+      },
+    } as unknown as Env;
+    const executionCtx = {
+      passThroughOnException: vi.fn(),
+      waitUntil: vi.fn(),
+    } as unknown as ExecutionContext;
+
+    verifySubServiceTokenMock.mockResolvedValue({
+      ok: false,
+      reason: 'Sub service token is required.',
+      status: 401,
+    });
+
+    const url = new URL('https://mother.example.com/api/sub/media-objects');
+    url.searchParams.set('serviceUrl', 'https://sub.example.com');
+    url.searchParams.set('mediaId', 'media-id');
+    url.searchParams.set('objectKey', 'media/schools/demo/2026/media-id.png');
+    url.searchParams.set('byteSize', '11');
+    url.searchParams.set('contentType', 'image/png');
+    const response = await worker.fetch(
+      new Request(url, {
+        body: 'media-bytes',
+        headers: {
+          authorization: 'Bearer invalid',
+          'content-type': 'image/png',
+        },
+        method: 'POST',
+      }),
+      env,
+      executionCtx,
+    );
+    const body = await response.json() as {
+      accepted: boolean;
+      stored: boolean;
+    };
+
+    expect(response.status).toBe(202);
+    expect(body).toEqual({
+      accepted: true,
+      stored: false,
+    });
+    expect(put).not.toHaveBeenCalled();
+  });
+});

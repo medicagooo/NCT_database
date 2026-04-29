@@ -2,6 +2,7 @@ interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
   EXPORT_BUCKET?: R2Bucket;
+  MEDIA_BUCKET?: R2Bucket;
   APP_NAME?: string;
   DEFAULT_ENCRYPT_FIELDS?: string;
   ENCRYPTION_KEY: string;
@@ -15,4 +16,8 @@ interface Env {
   RESEND_API_KEY?: string;
   EXPORT_EMAIL_TO?: string;
   EXPORT_EMAIL_FROM?: string;
+  MEDIA_CAPACITY_ALERT_BYTES?: string;
+  MEDIA_CAPACITY_ALERT_EMAIL_FROM?: string;
+  MEDIA_CAPACITY_ALERT_EMAIL_TO?: string;
+  MEDIA_CAPACITY_ALERT_MIN_INTERVAL_MS?: string;
 }

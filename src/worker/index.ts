@@ -23,6 +23,12 @@ import {
 } from './lib/data';
 import { exportSnapshot, hasExportBucket } from './lib/export';
 import {
+  checkMediaBucketCapacity,
+  hasMediaBucket,
+  isSafeLocalMediaObjectKey,
+  storeSubMediaObject,
+} from './lib/media-storage';
+import {
   AdminAuthError,
   assertAdminAuth,
   deleteAdminSession,
@@ -114,6 +120,14 @@ const subMediaRecordsSchema = z.object({
       }),
     )
     .min(1),
+});
+
+const subMediaObjectSchema = z.object({
+  byteSize: z.coerce.number().int().min(1),
+  contentType: z.string().min(1),
+  mediaId: z.string().min(1),
+  objectKey: z.string().min(1),
+  serviceUrl: z.string().url(),
 });
 
 const mediaReviewSchema = z.object({
@@ -218,6 +232,13 @@ function buildFakeMediaResults(request: {
   }));
 }
 
+function buildFakeMediaObjectResult() {
+  return {
+    accepted: true,
+    stored: false,
+  };
+}
+
 const tabularImportSchema = z.object({
   dataSourceType: z.enum(['questionnaire', 'batch_query']).optional(),
   dryRun: z.boolean().optional(),
@@ -226,6 +247,7 @@ const tabularImportSchema = z.object({
 });
 
 const EXPORT_CRON = '0 18 * * *';
+const MEDIA_CAPACITY_ALERT_CRON = '0 * * * *';
 
 const app = new Hono<{ Bindings: Env }>();
 const publicCors = cors({
@@ -539,6 +561,126 @@ app.post('/api/sub/media-records', async (context): Promise<Response> => {
   );
 });
 
+app.post('/api/sub/media-objects', async (context): Promise<Response> => {
+  if (!hasMediaBucket(context.env)) {
+    return context.json(
+      {
+        error: 'R2 media bucket is not configured.',
+      },
+      503,
+    );
+  }
+
+  const url = new URL(context.req.url);
+  const parsed = subMediaObjectSchema.safeParse({
+    byteSize: url.searchParams.get('byteSize'),
+    contentType: url.searchParams.get('contentType') || context.req.header('content-type') || '',
+    mediaId: url.searchParams.get('mediaId'),
+    objectKey: url.searchParams.get('objectKey'),
+    serviceUrl: url.searchParams.get('serviceUrl'),
+  });
+  if (!parsed.success) {
+    return context.json(
+      {
+        error: 'Invalid sub media object sync payload.',
+        details: parsed.error.flatten(),
+      },
+      400,
+    );
+  }
+
+  const tokenVerification = await verifySubServiceToken(
+    context.env,
+    parsed.data.serviceUrl,
+    readBearerToken(context.req.raw),
+    getSubAuthMaxFailures(context.env),
+  );
+  if (!tokenVerification.ok) {
+    return context.json(buildFakeMediaObjectResult(), 202);
+  }
+
+  if (!context.req.raw.body) {
+    return context.json(
+      {
+        error: 'Media object body is required.',
+      },
+      400,
+    );
+  }
+
+  const verifiedServiceUrl = tokenVerification.stored?.serviceUrl?.trim()
+    || parsed.data.serviceUrl;
+  const result = await storeSubMediaObject(context.env, {
+    body: context.req.raw.body,
+    byteSize: parsed.data.byteSize,
+    contentType: parsed.data.contentType,
+    mediaId: parsed.data.mediaId,
+    objectKey: parsed.data.objectKey,
+    requestUrl: context.req.url,
+    serviceUrl: verifiedServiceUrl,
+  });
+
+  return context.json(
+    {
+      accepted: true,
+      mediaId: parsed.data.mediaId,
+      ...result,
+    },
+    result.stored ? 202 : 409,
+  );
+});
+
+app.get('/api/media/files/*', async (context) => {
+  if (!hasMediaBucket(context.env)) {
+    return context.json(
+      {
+        error: 'R2 media bucket is not configured.',
+      },
+      503,
+    );
+  }
+
+  const prefix = '/api/media/files/';
+  const pathname = new URL(context.req.raw.url).pathname;
+  const encodedObjectKey = pathname.startsWith(prefix)
+    ? pathname.slice(prefix.length)
+    : '';
+  let objectKey = '';
+  try {
+    objectKey = decodeURIComponent(encodedObjectKey);
+  } catch {
+    objectKey = '';
+  }
+  if (!objectKey || !isSafeLocalMediaObjectKey(objectKey)) {
+    return context.json(
+      {
+        error: 'Media file key is invalid.',
+      },
+      400,
+    );
+  }
+
+  const object = await context.env.MEDIA_BUCKET.get(objectKey);
+  if (!object) {
+    return context.json(
+      {
+        error: 'Media file was not found.',
+      },
+      404,
+    );
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set('cache-control', headers.get('cache-control') ?? 'public, max-age=31536000, immutable');
+  headers.set('content-type', headers.get('content-type') ?? 'application/octet-stream');
+  headers.set('etag', object.httpEtag);
+
+  return new Response(object.body, {
+    headers,
+  });
+});
+
 app.get('/api/public/secure-records', async (context) => {
   const currentVersion = Number(
     context.req.query('currentVersion') ?? '0',
@@ -769,6 +911,27 @@ app.post('/api/admin/export-now', async (context) => {
   });
 });
 
+app.post('/api/admin/media-capacity-check', async (context) => {
+  const authError = await assertAdminAuth(context);
+  if (authError) {
+    return authError;
+  }
+
+  if (!hasMediaBucket(context.env)) {
+    return context.json(
+      {
+        error: 'R2 media bucket is not configured.',
+      },
+      503,
+    );
+  }
+
+  return context.json({
+    message: 'Media capacity check completed.',
+    ...await checkMediaBucketCapacity(context.env),
+  });
+});
+
 app.post('/api/admin/push-now', async (context) => {
   const authError = await assertAdminAuth(context);
   if (authError) {
@@ -836,6 +999,9 @@ export default {
   ) {
     if (controller.cron === EXPORT_CRON && hasExportBucket(env)) {
       executionCtx.waitUntil(exportSnapshot(env));
+    }
+    if (controller.cron === MEDIA_CAPACITY_ALERT_CRON && hasMediaBucket(env)) {
+      executionCtx.waitUntil(checkMediaBucketCapacity(env));
     }
   },
 };
